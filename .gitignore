@@ -6,3 +6,4 @@ logs/
 positions/
 accounts/*.local.py   # 如果有本地专属账户文件的话，视实际情况调整
 CLAUDE.md
+官方新版本/
