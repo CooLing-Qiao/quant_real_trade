@@ -1142,8 +1142,8 @@ class BinanceClient:
             'symbol': symbol,
             'side': side,
             'algoType': 'CONDITIONAL',  # 新版 Algo Order 接口固定要求这个字段，旧版 /fapi/v1/order 不需要
-            'type': 'STOP_MARKET',
-            'stopPrice': str(stop_price),
+            'orderType': 'STOP_MARKET',  # 新接口字段名是 orderType，不是旧接口的 type（已实测校准）
+            'triggerPrice': str(stop_price),  # 新接口字段名是 triggerPrice，不是旧接口的 stopPrice（已实测校准）
             'workingType': working_type,
             'positionSide': 'BOTH',  # 单向持仓模式固定 BOTH
             'timestamp': '',
