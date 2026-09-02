@@ -1,0 +1,13 @@
+{
+    "apps": [
+        {
+            "name": "pmt-startup",
+            "script": "/quantclass/pos-mgmt-trade/startup.py",
+            "exec_interpreter": "python",
+            "merge_logs": false,
+            "watch": false,
+            "error_file": "/quantclass/logs/pmt-startup.error.log",
+            "out_file": "/quantclass/logs/pmt-startup.out.log"
+        }
+    ]
+}

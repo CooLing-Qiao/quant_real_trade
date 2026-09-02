@@ -1,0 +1,436 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+丁针阶梯止盈（错时挂单版）
+
+用法：python dingzhen.py <账户名> [--dry-run]
+    <账户名> 对应 实盘/accounts/ 目录下的账户配置文件名（不含 .py 后缀）
+    --dry-run 干跑模式：正常读持仓、读市场信息、等待调仓完成信号、计算阶梯，
+              但不会真实下单/撤单，只打印"本来会挂出/撤掉什么"，用于上线前观察一个完整周期。
+
+设计说明：
+- 账户主循环（core/account_exec.py）在真正开始调仓前，会先把持仓读进内存做快照，之后子策略回测、
+  算目标仓位、下单整个流程要跑数十秒到数分钟。如果丁针的止盈单在这段时间里成交，主程序算出来的
+  目标仓位就是基于过期持仓的，下单量会算错。所以丁针不跟主循环抢挂单，而是"错时"运行：
+    1. 在主程序预计启动前 CANCEL_LEAD_MINUTES 分钟，主动撤掉自己挂的所有止盈单，让出场子；
+    2. 轮询主程序调仓完成的信号文件（data/<账户>/账户换仓信息/{YYYYMMDD}_{HH}.csv，
+       这是 core/real_trading.py: run_by_account 的最后一步产物，出现即代表本轮调仓彻底结束）；
+    3. 信号出现后，静置 SETTLE_SECONDS 秒，按这时的真实持仓重新计算并挂出整条阶梯止盈单；
+       等不到信号（主程序崩溃/跑在debug模式不写该文件）就在 WAIT_TIMEOUT_MINUTES 分钟后兜底，
+       按当前持仓直接挂单，并发企业微信告警。
+- 阶梯止盈：止盈价 = 这一小时K线的真实开盘价 × (1 ± level)（多头+，空头-），**与持仓成本（均价）
+  完全无关**——每小时都是独立的一次新赌注，不管这个仓位历史上盈亏多少。这个开盘价是直接问交易所
+  要"这一小时正在走的K线"拿到的（get_current_hour_open），从整点那一刻起就固定不变，不是用标记价
+  近似出来的，这样才能跟回测里"用每根K线自己的开盘价做基准，对比止盈拿到的价格与这根K线自己开盘
+  到收盘的收益"这套逻辑完全对上。多头 level 取 LADDER_LEVELS_LONG，空头取 LADDER_LEVELS_SHORT
+  （多空分开配置，是用这套回测方法挑出来的数据支持的档位，多空表现不对称，不能共用一套）。档位
+  平分当前持仓量。
+- 因为每小时都按当时的真实持仓重建，主策略自己加/减仓导致的持仓量变化会自动被下一次重建吸收，
+  不需要额外跟踪、校准。
+- 两次重建之间（挂单存续期）会持续做健康检查：每笔挂单按 orderId 核对交易所真实状态，
+  FILLED 就发通知，被意外撤单（CANCELED 等终态）就原样挂回。
+"""
+
+import json
+import math
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+from config import error_webhook_url
+from core.account_manager import init_system
+from core.utils.commons import retry_wrapper
+from core.utils.dingding import send_wechat_work_msg
+from core.utils.log_kit import logger, divider
+from core.utils.path_kit import get_file_path
+
+# ====================================================================================================
+# ** 配置 **
+# ====================================================================================================
+LADDER_LEVELS_LONG = [0.45, 0.60]   # 多头止盈档位（盈利比例）
+LADDER_LEVELS_SHORT = [0.25, 0.35]  # 空头止盈档位（盈利比例）
+
+CANCEL_LEAD_MINUTES = 5    # 主程序预计下单前多少分钟撤单清场
+WAIT_TIMEOUT_MINUTES = 20  # 等不到调仓完成信号，多久后兜底直接重建
+SETTLE_SECONDS = 20        # 看到完成信号后静置多久再读持仓（让最后的成交/结算落定）
+POLL_SECONDS = 15          # 清场前/等待信号期间的健康检查 & 轮询间隔
+
+TERMINAL_ORDER_STATUS = ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH')  # 视为"被撤单"的订单终态
+
+DRY_RUN = False  # 干跑模式开关，由 --dry-run 命令行参数设置，见文件末尾
+
+
+# ====================================================================================================
+# ** 状态持久化 **
+# 注意：不能放在 data/runtime/ 下——real_trading.py 每轮调仓开头会把整个 data/runtime/ 删掉重建。
+# ====================================================================================================
+def _state_file_path(account_name: str):
+    return get_file_path('data', 'dingzhen', f'{account_name}_state.json', as_path_type=True)
+
+
+def load_state(account_name: str) -> dict:
+    path = _state_file_path(account_name)
+    if path.exists():
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            logger.warning(f'丁针状态文件损坏，将重建：{path}')
+    return {}
+
+
+def save_state(account_name: str, state: dict):
+    path = _state_file_path(account_name)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ====================================================================================================
+# ** 交易所查询 / 下单 **
+# ====================================================================================================
+def get_open_swap_orders(acct_conf) -> pd.DataFrame:
+    """获取账户当前全部合约挂单（复用 cancel_all_swap_orders 用的同一套查询接口）"""
+    bn = acct_conf.bn
+    get_open_orders_func = getattr(bn.exchange, bn.constants.get('get_swap_open_orders_api'))
+    orders = retry_wrapper(get_open_orders_func, params={'timestamp': ''}, func_name='丁针查询合约挂单')
+    columns = ['symbol', 'orderId', 'side', 'price', 'origQty', 'reduceOnly']
+    if not orders:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(orders)
+    df['orderId'] = df['orderId'].astype(int)
+    df['price'] = pd.to_numeric(df['price'])
+    df['origQty'] = pd.to_numeric(df['origQty'])
+    return df
+
+
+def _query_order_api_name(acct_conf) -> str:
+    """按账户类型（普通账户/统一账户）推断单笔订单查询接口名，与 constants 里 open_orders 接口保持同一套命名规则"""
+    open_orders_api = acct_conf.bn.constants.get('get_swap_open_orders_api', '')
+    if open_orders_api.startswith('papi'):
+        return 'papi_get_um_order'
+    return 'fapiprivate_get_order'
+
+
+def query_order_status(acct_conf, symbol: str, order_id: int) -> dict | None:
+    """按 orderId 向交易所查询某笔订单的真实状态，查询失败返回 None（本轮先跳过，下一轮再确认）"""
+    bn = acct_conf.bn
+    query_func = getattr(bn.exchange, _query_order_api_name(acct_conf))
+    try:
+        return retry_wrapper(query_func, params={'symbol': symbol, 'orderId': order_id, 'timestamp': ''},
+                              func_name='丁针查询订单状态', retry_times=2, sleep_seconds=2)
+    except Exception as e:
+        logger.error(f'{symbol} 查询订单 {order_id} 状态失败：{e}')
+        return None
+
+
+def get_current_hour_open(acct_conf, symbol: str) -> float | None:
+    """
+    直接问交易所要"这一小时正在走的K线"的开盘价——从整点那一刻起就固定不变，是止盈档位真正应该
+    锚定的基准。core/binance/base_client.py 里现成的 get_candle_df 是给策略因子计算用的，专门把
+    还没走完的这根K线过滤掉了（避免用一根还在变化的K线算因子），所以这里不能复用，单独直接请求。
+    这是公共行情接口，普通账户/统一账户共用同一个方法名，不需要按账户类型区分。
+    """
+    bn = acct_conf.bn
+    try:
+        kline = retry_wrapper(bn.exchange.fapipublic_get_klines,
+                               params={'symbol': symbol, 'interval': '1h', 'limit': 1},
+                               func_name='丁针获取当前小时开盘价', retry_times=2, sleep_seconds=2)
+    except Exception as e:
+        logger.error(f'{symbol} 获取当前小时开盘价失败：{e}')
+        return None
+    if not kline:
+        return None
+    return float(kline[-1][1])  # K线字段顺序：0=开盘时间 1=open 2=high 3=low 4=close ...
+
+
+def round_price(price: float, precision: int) -> float:
+    return round(price, precision)
+
+
+def round_qty_down(qty: float, precision: int) -> float:
+    """数量向下取整到交易所允许的精度，避免因为四舍五入超过实际可平仓位"""
+    _m = 10 ** precision
+    return math.floor(qty * _m) / _m
+
+
+def place_one_order(acct_conf, symbol: str, side: str, qty: float, price: float) -> dict | None:
+    if DRY_RUN:
+        logger.info(f'[干跑] 将挂单：{symbol} {side} 数量 {qty} 价格 {price}（LIMIT/GTC/reduceOnly）—— 未真实下单')
+        return {'order_id': -int(time.time() * 1000), 'qty': qty, 'price': price, 'side': side, 'status': 'simulated'}
+
+    res = acct_conf.bn.place_swap_order(
+        symbol=symbol,
+        side=side,
+        quantity=qty,
+        price=price,
+        type='LIMIT',
+        timeInForce='GTC',
+        reduceOnly=str(True),
+    )
+    if not res or not res.get('orderId'):
+        return None
+    return {'order_id': int(res['orderId']), 'qty': qty, 'price': price, 'side': side, 'status': 'open'}
+
+
+def place_rung_order(acct_conf, symbol: str, side: str, qty: float, price: float, level: float) -> dict | None:
+    """挂出一档阶梯止盈单。GTC 限价单是被动挂单，不存在市价单那种"冲击市场"的问题，
+    所以不按 max_one_order_amount 拆单——拆单只会白白引入额外的精度取整误差。"""
+    order = place_one_order(acct_conf, symbol, side, qty, price)
+    if order is None:
+        logger.error(f'{symbol} 第{level * 100:.0f}%档止盈单下单失败：数量 {qty}，价格 {price}')
+        return None
+    order['level'] = level
+    return order
+
+
+# ====================================================================================================
+# ** 阶梯计算 **
+# ====================================================================================================
+def build_ladder_plan(hour_open_price: float, position_amt: float,
+                       price_precision: int, qty_precision: int) -> list:
+    """
+    根据这一小时K线的真实开盘价、当前持仓量，算出这一小时要挂的止盈档位。
+    跟持仓成本（均价）完全无关——每小时都是独立的一次新赌注。
+    多头（position_amt > 0）：止盈价 = hour_open_price * (1 + level)，卖出平多
+    空头（position_amt < 0）：止盈价 = hour_open_price * (1 - level)，买入平空
+    档位平分当前持仓量。
+    """
+    is_long = position_amt > 0
+    total_qty = abs(position_amt)
+    levels = LADDER_LEVELS_LONG if is_long else LADDER_LEVELS_SHORT
+
+    qty_each = round_qty_down(total_qty / len(levels), qty_precision)
+    if qty_each <= 0:
+        return []
+
+    side = 'SELL' if is_long else 'BUY'
+    plan = []
+    for level in levels:
+        price = hour_open_price * (1 + level) if is_long else hour_open_price * (1 - level)
+        price = round_price(price, price_precision)
+        plan.append({'level': level, 'price': price, 'qty': qty_each, 'side': side})
+    return plan
+
+
+# ====================================================================================================
+# ** 订单状态核对（挂单是否还在 / 成交 / 被撤）**
+# ====================================================================================================
+def _resolve_order(acct_conf, symbol: str, order: dict, open_order_ids: set) -> str:
+    """返回 'open' / 'filled' / 'canceled' / 'unknown'，不做任何下单/撤单动作"""
+    if order['order_id'] in open_order_ids:
+        return 'open'
+    order_info = query_order_status(acct_conf, symbol, order['order_id'])
+    status = (order_info or {}).get('status')
+    if status == 'FILLED':
+        return 'filled'
+    if status in TERMINAL_ORDER_STATUS:
+        return 'canceled'
+    return 'unknown'
+
+
+def notify_fill(acct_conf, symbol: str, order: dict):
+    msg = (f"【丁针止盈】{symbol} 第{order['level'] * 100:.0f}%档止盈单已成交，"
+           f"数量 {order['qty']}，价格 {order['price']}")
+    logger.ok(msg)
+    send_wechat_work_msg(msg, acct_conf.wechat_webhook_url)
+
+
+def health_check(acct_conf, state: dict):
+    """挂单存续期间的巡检：确认成交就通知，被意外撤单就原样挂回"""
+    if DRY_RUN or not state:
+        return
+    open_orders_df = get_open_swap_orders(acct_conf)
+    open_order_ids = set(open_orders_df['orderId']) if not open_orders_df.empty else set()
+
+    for symbol in list(state.keys()):
+        sym_state = state[symbol]
+        still_open = []
+        for order in sym_state.get('orders', []):
+            result = _resolve_order(acct_conf, symbol, order, open_order_ids)
+            if result == 'open' or result == 'unknown':
+                still_open.append(order)
+            elif result == 'filled':
+                notify_fill(acct_conf, symbol, order)
+            elif result == 'canceled':
+                logger.warning(f'{symbol} 第{order["level"] * 100:.0f}%档止盈单被意外撤单，重新挂回')
+                new_order = place_one_order(acct_conf, symbol, order['side'], order['qty'], order['price'])
+                if new_order is not None:
+                    new_order['level'] = order['level']
+                    still_open.append(new_order)
+                else:
+                    logger.error(f'{symbol} 第{order["level"] * 100:.0f}%档止盈单重新挂回失败，'
+                                 f'该档本轮将不再持有，等下一次重建')
+
+        if still_open:
+            sym_state['orders'] = still_open
+        else:
+            state.pop(symbol, None)
+
+
+def clear_ladders(acct_conf, state: dict):
+    """撤掉丁针挂过的所有止盈单，为主程序调仓让路。已确认成交的先发通知，再清空状态"""
+    if not state:
+        return
+
+    if DRY_RUN:
+        logger.info(f'[干跑] 将撤单清场：{list(state.keys())} —— 未真实撤单')
+        state.clear()
+        return
+
+    open_orders_df = get_open_swap_orders(acct_conf)
+    open_order_ids = set(open_orders_df['orderId']) if not open_orders_df.empty else set()
+
+    for symbol, sym_state in state.items():
+        for order in sym_state.get('orders', []):
+            if _resolve_order(acct_conf, symbol, order, open_order_ids) == 'filled':
+                notify_fill(acct_conf, symbol, order)
+
+    symbols = list(state.keys())
+    acct_conf.bn.cancel_all_swap_orders(symbol_list=symbols)
+    logger.info(f'丁针已撤单清场：{symbols}')
+    state.clear()
+
+
+def rebuild_ladders(acct_conf, state: dict):
+    """按当前真实持仓重新计算并挂出整条阶梯止盈单"""
+    position_df = acct_conf.bn.get_swap_position_df()
+    if position_df.empty:
+        logger.info('丁针重建：当前无合约持仓，无需挂止盈单')
+        return
+
+    market_info = acct_conf.bn.get_market_info('swap', require_update=True)
+
+    for symbol, row in position_df.iterrows():
+        try:
+            position_amt = float(row['当前持仓量'])
+            price_precision = market_info['price_precision'].get(symbol, 4)
+            qty_precision = market_info['min_qty'].get(symbol, 4)
+            min_notional = market_info['min_notional'].get(symbol, 5)
+
+            hour_open_price = get_current_hour_open(acct_conf, symbol)
+            if hour_open_price is None:
+                logger.error(f'{symbol} 拿不到本小时开盘价，本周期跳过挂单')
+                continue
+
+            plan = build_ladder_plan(hour_open_price, position_amt, price_precision, qty_precision)
+            if not plan:
+                logger.info(f'{symbol} 仓位过小，本周期不挂止盈单')
+                continue
+
+            orders = []
+            for rung in plan:
+                if rung['qty'] * rung['price'] < min_notional:
+                    logger.warning(f'{symbol} 第{rung["level"] * 100:.0f}%档止盈单金额低于最小下单额，跳过')
+                    continue
+                order = place_rung_order(acct_conf, symbol, rung['side'], rung['qty'], rung['price'], rung['level'])
+                if order is not None:
+                    orders.append(order)
+
+            if orders:
+                state[symbol] = {'orders': orders}
+                verb = '（干跑）计算出' if DRY_RUN else '已挂出'
+                logger.ok(f'{symbol} {verb} {len(orders)} 笔阶梯止盈单，本小时开盘价 {hour_open_price}')
+        except Exception as e:
+            logger.error(f'{symbol} 重建阶梯止盈单出错：{e}')
+            logger.debug(traceback.format_exc())
+
+
+# ====================================================================================================
+# ** 与主程序错时调度 **
+# ====================================================================================================
+def next_main_run_time(hour_offset_minute: int, after: datetime = None) -> datetime:
+    """计算下一个『主程序应该完成下单』的整点+offset时刻"""
+    after = after or datetime.now()
+    candidate = after.replace(minute=hour_offset_minute, second=0, microsecond=0)
+    if candidate <= after:
+        candidate += timedelta(hours=1)
+    return candidate
+
+
+def completion_file_path(acct_conf, run_time: datetime):
+    """主程序本轮调仓完成的信号文件：core/real_trading.py: run_by_account 最后一步的落盘产物"""
+    filename = run_time.strftime('%Y%m%d_%H') + '.csv'
+    return get_file_path('data', acct_conf.name, '账户换仓信息', filename, as_path_type=True, auto_create=False)
+
+
+def wait_for_completion(acct_conf, run_time: datetime, deadline: datetime) -> bool:
+    """轮询调仓完成信号。调用方在此之前已经 clear_ladders 清空了 state，此时没有任何挂单需要巡检，
+    所以这里只是单纯等待，不调用 health_check（state 必为空，调用了也是空转）。"""
+    path = completion_file_path(acct_conf, run_time)
+    while datetime.now() < deadline:
+        if path.exists():
+            return True
+        time.sleep(POLL_SECONDS)
+    return False
+
+
+def run_cycle(acct_conf, state: dict, run_time: datetime):
+    cancel_at = run_time - timedelta(minutes=CANCEL_LEAD_MINUTES)
+    deadline = run_time + timedelta(minutes=WAIT_TIMEOUT_MINUTES)
+
+    # ---- 挂单存续期：巡检直到临近主程序下单时刻 ----
+    while datetime.now() < cancel_at:
+        health_check(acct_conf, state)
+        time.sleep(POLL_SECONDS)
+
+    # ---- 清场，给主程序让路 ----
+    logger.info(f'距离 {run_time:%Y-%m-%d %H:%M} 主程序调仓还剩 {CANCEL_LEAD_MINUTES} 分钟，丁针清场')
+    clear_ladders(acct_conf, state)
+
+    # ---- 等待调仓完成信号 ----
+    got_signal = wait_for_completion(acct_conf, run_time, deadline)
+    if got_signal:
+        logger.info(f'检测到 {run_time:%Y-%m-%d %H:%M} 调仓完成信号，静置 {SETTLE_SECONDS}s 后重建阶梯止盈单')
+        time.sleep(SETTLE_SECONDS)
+    else:
+        msg = f'丁针等待 {run_time:%Y-%m-%d %H:%M} 调仓完成信号超时（{WAIT_TIMEOUT_MINUTES}分钟），按当前持仓直接重建止盈单'
+        logger.warning(msg)
+        if not DRY_RUN:
+            send_wechat_work_msg(msg, acct_conf.wechat_webhook_url)
+
+    # ---- 按当前真实持仓重建整条阶梯 ----
+    rebuild_ladders(acct_conf, state)
+    if DRY_RUN:
+        logger.info(f'[干跑] 本周期计算结果（不落盘）：{json.dumps(state, ensure_ascii=False, indent=2)}')
+    else:
+        save_state(acct_conf.name, state)
+
+
+def main(account_name: str):
+    acct_conf, _ = init_system(account_name)
+    tag = '（干跑/DRY-RUN，不会真实下单撤单）' if DRY_RUN else ''
+    divider(f'🎯 丁针阶梯止盈启动（错时挂单版）{tag} [{acct_conf.name}]', '+')
+
+    state = {} if DRY_RUN else load_state(acct_conf.name)
+    run_time = next_main_run_time(acct_conf.hour_offset_minute)
+    logger.info(f'下一个调仓时刻：{run_time}')
+
+    while True:
+        run_cycle(acct_conf, state, run_time)
+        run_time = next_main_run_time(acct_conf.hour_offset_minute, after=run_time)
+        logger.info(f'下一个调仓时刻：{run_time}')
+
+
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    DRY_RUN = '--dry-run' in args
+    args = [a for a in args if a != '--dry-run']
+
+    if not args:
+        logger.error('❌ 请传入账户名，例如：python dingzhen.py 0m超混 [--dry-run]')
+        sys.exit(1)
+
+    account_name = args[0]
+
+    while True:
+        try:
+            main(account_name)
+        except Exception as err:
+            msg = '丁针系统出错，10s之后重新运行，出错原因: ' + str(err)
+            logger.error(msg)
+            logger.debug(traceback.format_exc())
+            send_wechat_work_msg(msg, error_webhook_url)
+            time.sleep(10)

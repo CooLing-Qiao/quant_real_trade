@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+data/
+logs/
+positions/
+accounts/*.local.py   # 如果有本地专属账户文件的话，视实际情况调整
