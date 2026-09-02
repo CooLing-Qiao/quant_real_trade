@@ -330,10 +330,13 @@ def notify_fill(acct_conf, symbol: str, order: dict):
 
 
 def health_check(acct_conf, state: dict):
-    """挂单存续期间的巡检：确认成交就通知，被意外撤单就原样挂回（前提是仓位还在同一方向——
-    如果这个仓位是被止损条件单平掉的，币安会自动撤销同symbol的reduceOnly止盈单，这时候原样挂回
-    一张空仓的reduceOnly单只会被交易所拒绝，还会触发 place_swap_order 内部的异常告警，纯噪音，
-    所以撤单原因是"canceled"时补一次持仓校验，仓位已经不在同方向就不再挂回）"""
+    """挂单存续期间的巡检：确认成交就通知，被意外撤单就原样挂回（前提是仓位还在同一方向）。
+    这里加一次持仓校验是安全网：止损触发平仓后，本函数末尾的 health_check_stop_orders 会主动
+    撤掉同symbol残留的止盈单，但那是在本轮ladder检查【之后】才执行的（写在下面调用顺序里），
+    所以刚触发的那一轮巡检，ladder订单在这里可能还没被撤、状态仍是"open"；不管是这种"还没
+    轮到"的情况，还是订单确实已经被撤销，只要一看到"canceled"就补一次方向校验——仓位已经
+    不对就不再挂回，否则原样挂回一张空仓的reduceOnly单只会被交易所拒绝，还会触发
+    place_swap_order 内部的异常告警，纯噪音"""
     if DRY_RUN or not state:
         return
     open_orders_df = get_open_swap_orders(acct_conf)
@@ -569,8 +572,14 @@ def rebuild_stop_orders(acct_conf, state: dict):
 def health_check_stop_orders(acct_conf, state: dict):
     """止损条件单巡检：跟丁针止盈单不同，止损单不需要"被撤就挂回"（重挂的判断依赖当时的持仓和
     is_crash 状态，只在整点 rebuild_stop_orders 里做一次即可，没必要在巡检里高频重算）。
-    这里只做一件事：尽早发现某张止损单"消失了"，然后区分是正常触发（仓位已平）还是异常丢失
-    （仓位还在但保护没了），分别发不同的告警内容。"""
+    这里做两件事：1）尽早发现某张止损单"消失了"，区分是正常触发（仓位已平）还是异常丢失
+    （仓位还在但保护没了），分别发不同的告警内容；2）如果是正常触发，主动撤掉这个symbol上
+    残留的止盈限价单（丁针的ladder orders）——不假设币安会在仓位归零时自动撤掉同symbol的
+    reduceOnly止盈单（这个行为没有实测验证过，不能把安全性建立在一个没验证的假设上）。
+    即使交易所真的会自动撤，这里的主动撤单也只是幂等地清空一个已经不存在的挂单，无副作用；
+    如果交易所不会自动撤，不主动清理的话，这些残留的reduceOnly止盈单要等到下一次整点
+    clear_ladders才会被清掉，最多裸奔近1小时——虽然reduceOnly本身保证它们不会在没有持仓时
+    被动成交、扩大不该有的仓位，但没必要留着这个不确定性。"""
     symbols_with_stop = [s for s, v in state.items() if v.get('stop', {}).get('algo_id')]
     if not symbols_with_stop:
         return
@@ -588,6 +597,10 @@ def health_check_stop_orders(acct_conf, state: dict):
         if position_amt <= 0:
             msg = f'【止损触发】{symbol} 止损条件单已消失，持仓已平（stopPrice={stop["stop_price"]}）'
             logger.ok(msg)
+            if state[symbol].get('orders'):
+                logger.info(f'{symbol} 止损已把仓位平掉，主动撤销该symbol残留的止盈限价单，不等下一整点')
+                acct_conf.bn.cancel_all_swap_orders(symbol_list=[symbol])
+                state[symbol].pop('orders', None)
         else:
             msg = (f'【止损异常】{symbol} 止损条件单消失但仓位仍在（{position_amt}），'
                   f'可能被误撤，等待下一次整点重建恢复保护')
