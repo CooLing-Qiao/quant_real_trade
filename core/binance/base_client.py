@@ -1141,6 +1141,7 @@ class BinanceClient:
         params = {
             'symbol': symbol,
             'side': side,
+            'algoType': 'CONDITIONAL',  # 新版 Algo Order 接口固定要求这个字段，旧版 /fapi/v1/order 不需要
             'type': 'STOP_MARKET',
             'stopPrice': str(stop_price),
             'workingType': working_type,
