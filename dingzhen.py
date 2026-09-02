@@ -29,6 +29,21 @@
   不需要额外跟踪、校准。
 - 两次重建之间（挂单存续期）会持续做健康检查：每笔挂单按 orderId 核对交易所真实状态，
   FILLED 就发通知，被意外撤单（CANCELED 等终态）就原样挂回。
+
+is_crash 期间合约多头单K止损（STOP_LOSS_ENABLED，默认关闭）：
+- 只做多头止损，不做对称的空头止损（暴涨止损）——已经过代理估算验证是灾难性的，绝对不要加。
+- is_crash 独立按持仓币自己的K线重新判定（过去 CRASH_WINDOW=144 小时内出现过单根跌幅低于
+  CRASH_THRESHOLD 的暴跌），跟 factors/Acc_reverse_v3.py 里的同名概念判定逻辑一致但窗口不同；
+  本账户实际持有多头的子策略（Acc_reverse/Trix）都不引用 Acc_reverse_v3，没有现成的 is_crash
+  可以直接复用。
+- 止损用交易所侧的条件单（STOP_MARKET + closePosition=true），不是本地轮询：普通限价单挂在
+  不利方向会被立即撮合，做不了止损；本地轮询的延迟又恰好打在最该保护的场景（瀑布行情常常几分钟
+  内走完）。2025-12-09 币安把条件单强制迁移到独立的 /fapi/v1/algoOrder 接口（不再支持走
+  /fapi/v1/order 下单），对应封装见 core/binance/base_client.py 的 place_swap_algo_order /
+  get_swap_algo_open_orders / cancel_swap_algo_order。
+- 止损单不跟着止盈单一起在 CANCEL_LEAD_MINUTES 时提前撤（止损是保险，不该在调仓窗口裸奔），
+  而是在 rebuild_ladders 之后、每小时统一"先撤旧的、再按新持仓判定挂新的"。
+- 只对普通账户（fapi）生效，统一账户（papi）未接入。
 """
 
 import json
@@ -59,6 +74,16 @@ SETTLE_SECONDS = 20        # 看到完成信号后静置多久再读持仓（让
 POLL_SECONDS = 15          # 清场前/等待信号期间的健康检查 & 轮询间隔
 
 TERMINAL_ORDER_STATUS = ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH')  # 视为"被撤单"的订单终态
+
+# ++++ is_crash 期间合约多头单K止损 ++++
+# 背景见 docs（研究结论）：is_crash 期间的多头，若单根K线跌幅过深，加一道交易所侧的条件止损，
+# 把左尾损失截断在阈值附近。只做多头止损——对称的空头止损（暴涨止损）已经过代理估算验证是灾难性的，
+# 绝对不要加。默认关闭，开关式上线。
+STOP_LOSS_ENABLED = False   # 总开关，默认关闭
+CRASH_WINDOW = 144          # is_crash 判定窗口（小时），注意不是 Acc_reverse_v3 因子出厂默认的96小时
+CRASH_THRESHOLD = -0.10     # 窗口内只要有一根K线跌幅低于此阈值，即判定为 is_crash
+STOP_DROP = 0.12            # 止损线：相对上一根已收盘K线收盘价的跌幅
+STOP_WORKING_TYPE = 'CONTRACT_PRICE'  # 条件单触发价格基准，跟回测口径（用K线价格）对齐，不用标记价
 
 DRY_RUN = False  # 干跑模式开关，由 --dry-run 命令行参数设置，见文件末尾
 
@@ -146,6 +171,55 @@ def get_current_hour_open(acct_conf, symbol: str) -> float | None:
     return float(kline[-1][1])  # K线字段顺序：0=开盘时间 1=open 2=high 3=low 4=close ...
 
 
+def get_recent_closed_closes(acct_conf, symbol: str, limit: int) -> list:
+    """
+    获取该币最近 limit 根【已收盘】1小时K线的收盘价，按时间升序排列。
+    跟 get_current_hour_open 用同一个公开行情接口（fapipublic_get_klines），多请求2根做缓冲，
+    并且无条件丢弃最后一根——交易所返回的最后一根可能是正在走的当前小时K线，is_crash 的判定口径
+    （factors/Acc_reverse_v3.py）只用"已经走完"的K线，混进还在变化的最新数据会让判定在盘中反复
+    开关，产生毛刺。
+    """
+    bn = acct_conf.bn
+    try:
+        klines = retry_wrapper(bn.exchange.fapipublic_get_klines,
+                               params={'symbol': symbol, 'interval': '1h', 'limit': limit + 2},
+                               func_name='止损获取历史K线', retry_times=2, sleep_seconds=2)
+    except Exception as e:
+        logger.error(f'{symbol} 获取历史K线失败，本周期跳过止损判定：{e}')
+        return []
+    if not klines or len(klines) < 2:
+        return []
+    closed = klines[:-1]  # 丢弃最后一根（可能未收盘）
+    return [float(k[4]) for k in closed[-limit:]]  # K线字段顺序：4=close
+
+
+def is_crash_symbol(closes: list) -> bool:
+    """
+    过去 CRASH_WINDOW 根已收盘K线内，是否出现过单根跌幅低于 CRASH_THRESHOLD 的暴跌。
+    判定逻辑跟 factors/Acc_reverse_v3.py 里的 is_crash 完全一致
+    （min_change = close.pct_change().rolling(window, min_periods=1).min(); is_crash = min_change < 阈值），
+    只是这里独立维护、窗口用 CRASH_WINDOW=144小时（而不是该因子出厂默认的96小时）——本账户实际
+    持有多头的子策略是 Acc_reverse/Trix，都不引用 Acc_reverse_v3，没有现成的 is_crash 可以直接复用，
+    只能按持仓币自己的K线重新算一遍。
+    :param closes: 按时间升序排列的已收盘K线收盘价
+    """
+    if len(closes) < 2:
+        return False
+    pct_change = pd.Series(closes, dtype='float64').pct_change()
+    return bool((pct_change < CRASH_THRESHOLD).any())
+
+
+def build_stop_plan(prev_close: float, position_amt: float, price_precision: int) -> dict | None:
+    """
+    只对净持仓为多头的币生成止损计划：SELL 平多，stopPrice = 上一根已收盘K线收盘价 * (1 - STOP_DROP)。
+    净持仓为空头/无持仓时返回 None——空头止损（暴涨止损）已经过代理估算验证是灾难性的，不做。
+    """
+    if position_amt <= 0:
+        return None
+    stop_price = round_price(prev_close * (1 - STOP_DROP), price_precision)
+    return {'side': 'SELL', 'stop_price': stop_price}
+
+
 def round_price(price: float, precision: int) -> float:
     return round(price, precision)
 
@@ -184,6 +258,22 @@ def place_rung_order(acct_conf, symbol: str, side: str, qty: float, price: float
         return None
     order['level'] = level
     return order
+
+
+def place_stop_order(acct_conf, symbol: str, side: str, stop_price: float) -> dict | None:
+    """挂一张止损条件单（STOP_MARKET/closePosition=true）。跟丁针止盈单的 place_one_order 保持同一个
+    DRY_RUN 处理模式：干跑下只打印、返回一个假 algo_id，不发真实请求。"""
+    if DRY_RUN:
+        logger.info(f'[干跑] 将挂止损单：{symbol} {side} stopPrice={stop_price}（STOP_MARKET/closePosition）'
+                    f'—— 未真实下单')
+        return {'algo_id': -int(time.time() * 1000), 'stop_price': stop_price, 'side': side, 'status': 'simulated'}
+
+    res = acct_conf.bn.place_swap_algo_order(symbol, side, stop_price, close_position=True,
+                                             working_type=STOP_WORKING_TYPE)
+    algo_id = res.get('algoId') or res.get('clientAlgoId')
+    if not algo_id:
+        return None
+    return {'algo_id': algo_id, 'stop_price': stop_price, 'side': side, 'status': 'open'}
 
 
 # ====================================================================================================
@@ -239,11 +329,15 @@ def notify_fill(acct_conf, symbol: str, order: dict):
 
 
 def health_check(acct_conf, state: dict):
-    """挂单存续期间的巡检：确认成交就通知，被意外撤单就原样挂回"""
+    """挂单存续期间的巡检：确认成交就通知，被意外撤单就原样挂回（前提是仓位还在同一方向——
+    如果这个仓位是被止损条件单平掉的，币安会自动撤销同symbol的reduceOnly止盈单，这时候原样挂回
+    一张空仓的reduceOnly单只会被交易所拒绝，还会触发 place_swap_order 内部的异常告警，纯噪音，
+    所以撤单原因是"canceled"时补一次持仓校验，仓位已经不在同方向就不再挂回）"""
     if DRY_RUN or not state:
         return
     open_orders_df = get_open_swap_orders(acct_conf)
     open_order_ids = set(open_orders_df['orderId']) if not open_orders_df.empty else set()
+    position_df = None  # 惰性获取：只有真的遇到"被撤单"才查一次，避免每轮巡检都多打一次接口
 
     for symbol in list(state.keys()):
         sym_state = state[symbol]
@@ -255,6 +349,16 @@ def health_check(acct_conf, state: dict):
             elif result == 'filled':
                 notify_fill(acct_conf, symbol, order)
             elif result == 'canceled':
+                if position_df is None:
+                    position_df = acct_conf.bn.get_swap_position_df()
+                position_amt = float(position_df.loc[symbol, '当前持仓量']) if symbol in position_df.index else 0.0
+                # 止盈单方向和持仓方向相反：SELL 平多要求仓位还是多头，BUY 平空要求仓位还是空头
+                still_same_direction = (order['side'] == 'SELL' and position_amt > 0) or \
+                                       (order['side'] == 'BUY' and position_amt < 0)
+                if not still_same_direction:
+                    logger.info(f'{symbol} 第{order["level"] * 100:.0f}%档止盈单被撤且仓位方向已不同'
+                               f'（大概率是止损触发平仓），不再挂回')
+                    continue
                 logger.warning(f'{symbol} 第{order["level"] * 100:.0f}%档止盈单被意外撤单，重新挂回')
                 new_order = place_one_order(acct_conf, symbol, order['side'], order['qty'], order['price'])
                 if new_order is not None:
@@ -267,17 +371,34 @@ def health_check(acct_conf, state: dict):
         if still_open:
             sym_state['orders'] = still_open
         else:
+            sym_state.pop('orders', None)
+        if not sym_state.get('orders') and not sym_state.get('stop'):
+            state.pop(symbol, None)
+
+    if STOP_LOSS_ENABLED:
+        health_check_stop_orders(acct_conf, state)
+
+
+def _clear_ladder_keys(state: dict):
+    """只清掉每个symbol的止盈'orders'子键，保留'stop'子键（止损条件单的状态跟踪）。
+    不能用 state.clear() 整体清空——那会把止损单的 algoId 记录也一起冲掉，导致
+    clear_stop_orders 只能靠兜底扫描去撤单，失去按 algoId 精确撤单的能力。"""
+    for symbol in list(state.keys()):
+        state[symbol].pop('orders', None)
+        if not state[symbol]:
             state.pop(symbol, None)
 
 
 def clear_ladders(acct_conf, state: dict):
-    """撤掉丁针挂过的所有止盈单，为主程序调仓让路。已确认成交的先发通知，再清空状态"""
+    """撤掉丁针挂过的所有止盈单，为主程序调仓让路。已确认成交的先发通知，再清空止盈相关状态。
+    止损条件单不在这里处理——它是交易所侧的保险，不跟着止盈单一起提前撤，撤销/重建的时机见
+    run_cycle 里 clear_stop_orders 的调用位置和注释。"""
     if not state:
         return
 
     if DRY_RUN:
         logger.info(f'[干跑] 将撤单清场：{list(state.keys())} —— 未真实撤单')
-        state.clear()
+        _clear_ladder_keys(state)
         return
 
     open_orders_df = get_open_swap_orders(acct_conf)
@@ -288,10 +409,11 @@ def clear_ladders(acct_conf, state: dict):
             if _resolve_order(acct_conf, symbol, order, open_order_ids) == 'filled':
                 notify_fill(acct_conf, symbol, order)
 
-    symbols = list(state.keys())
-    acct_conf.bn.cancel_all_swap_orders(symbol_list=symbols)
-    logger.info(f'丁针已撤单清场：{symbols}')
-    state.clear()
+    symbols = [s for s, v in state.items() if v.get('orders')]
+    if symbols:
+        acct_conf.bn.cancel_all_swap_orders(symbol_list=symbols)
+        logger.info(f'丁针已撤单清场：{symbols}')
+    _clear_ladder_keys(state)
 
 
 def rebuild_ladders(acct_conf, state: dict):
@@ -330,7 +452,10 @@ def rebuild_ladders(acct_conf, state: dict):
                     orders.append(order)
 
             if orders:
-                state[symbol] = {'orders': orders}
+                # 用 setdefault 合并写入而不是整体覆盖 state[symbol]——这一步执行时同一symbol
+                # 可能已经有本轮 rebuild_stop_orders 尚未写入、但上一轮遗留的 'stop' 子键
+                # （理论上 clear_ladders 只清 'orders'，'stop' 应该还在），整体覆盖会把它冲掉。
+                state.setdefault(symbol, {})['orders'] = orders
                 verb = '（干跑）计算出' if DRY_RUN else '已挂出'
                 logger.ok(f'{symbol} {verb} {len(orders)} 笔阶梯止盈单，本小时开盘价 {hour_open_price}')
         except Exception as e:
@@ -357,14 +482,120 @@ def completion_file_path(acct_conf, run_time: datetime):
 
 
 def wait_for_completion(acct_conf, run_time: datetime, deadline: datetime) -> bool:
-    """轮询调仓完成信号。调用方在此之前已经 clear_ladders 清空了 state，此时没有任何挂单需要巡检，
-    所以这里只是单纯等待，不调用 health_check（state 必为空，调用了也是空转）。"""
+    """轮询调仓完成信号。调用方在此之前已经 clear_ladders 清空了 state 里的止盈'orders'子键
+    （止损条件单仍然照常挂在交易所，state 里对应的'stop'子键也还在），这段等待期间没有止盈挂单
+    需要巡检，所以这里只是单纯等待，不调用 health_check。"""
     path = completion_file_path(acct_conf, run_time)
     while datetime.now() < deadline:
         if path.exists():
             return True
         time.sleep(POLL_SECONDS)
     return False
+
+
+# ====================================================================================================
+# ** is_crash 期间合约多头单K止损 **
+# ====================================================================================================
+def clear_stop_orders(acct_conf, state: dict):
+    """撤掉上一小时挂的全部止损条件单。先按 state 里记录的 algoId 精确撤，再用交易所侧的条件单
+    列表兜底核对——万一 state 没保存成功（比如上次进程在写文件前崩溃），孤儿止损单会一直挂在账户上，
+    它的 closePosition=true 是认 symbol 不认方向的，如果这个 symbol 下一小时反手做空，孤儿的多头止损单
+    会在错误的方向上触发平仓，所以这里的兜底扫描不是可选项。
+    这个函数只清账户里现存的条件单，不判断是否应该重新挂——重新挂的判断在 rebuild_stop_orders。"""
+    if DRY_RUN:
+        symbols = [s for s, v in state.items() if v.get('stop')]
+        if symbols:
+            logger.info(f'[干跑] 将撤销止损单：{symbols} —— 未真实撤单')
+        for sym_state in state.values():
+            sym_state.pop('stop', None)
+        return
+
+    for symbol in list(state.keys()):
+        sym_state = state[symbol]
+        stop = sym_state.pop('stop', None)
+        if stop and stop.get('algo_id'):
+            acct_conf.bn.cancel_swap_algo_order(symbol, algo_id=stop['algo_id'])
+        if not sym_state:
+            state.pop(symbol, None)
+
+    # 兜底：扫描账户里所有还挂着的条件单，防止 state 丢失导致孤儿单遗留到下一小时
+    leftover = acct_conf.bn.get_swap_algo_open_orders()
+    for order in leftover:
+        symbol, algo_id = order.get('symbol'), order.get('algoId')
+        if symbol and algo_id:
+            logger.warning(f'{symbol} 发现孤儿止损条件单 {algo_id}（state 中未记录），一并撤销')
+            acct_conf.bn.cancel_swap_algo_order(symbol, algo_id=algo_id)
+
+
+def rebuild_stop_orders(acct_conf, state: dict):
+    """按当前真实持仓，对净持仓为多头且命中 is_crash 的币重新挂止损条件单。
+    必须在 clear_stop_orders 之后调用——顺序颠倒会导致新一轮的止损单被自己紧接着撤掉。"""
+    position_df = acct_conf.bn.get_swap_position_df()
+    if position_df.empty:
+        logger.info('止损重建：当前无合约持仓，跳过')
+        return
+
+    market_info = acct_conf.bn.get_market_info('swap', require_update=True)
+
+    for symbol, row in position_df.iterrows():
+        try:
+            position_amt = float(row['当前持仓量'])
+            if position_amt <= 0:
+                continue  # 只做多头止损，空头/无持仓不处理
+
+            closes = get_recent_closed_closes(acct_conf, symbol, CRASH_WINDOW)
+            if not closes or not is_crash_symbol(closes):
+                continue
+
+            price_precision = market_info['price_precision'].get(symbol, 4)
+            plan = build_stop_plan(closes[-1], position_amt, price_precision)
+            if plan is None:
+                continue
+
+            order = place_stop_order(acct_conf, symbol, plan['side'], plan['stop_price'])
+            if order is None:
+                logger.error(f'{symbol} 止损条件单下单失败，本周期该币无止损保护')
+                continue
+
+            state.setdefault(symbol, {})['stop'] = order
+            verb = '（干跑）计算出' if DRY_RUN else '已挂出'
+            logger.ok(f'{symbol} is_crash 命中，{verb}止损单，stopPrice={plan["stop_price"]}')
+        except Exception as e:
+            logger.error(f'{symbol} 重建止损单出错：{e}')
+            logger.debug(traceback.format_exc())
+
+
+def health_check_stop_orders(acct_conf, state: dict):
+    """止损条件单巡检：跟丁针止盈单不同，止损单不需要"被撤就挂回"（重挂的判断依赖当时的持仓和
+    is_crash 状态，只在整点 rebuild_stop_orders 里做一次即可，没必要在巡检里高频重算）。
+    这里只做一件事：尽早发现某张止损单"消失了"，然后区分是正常触发（仓位已平）还是异常丢失
+    （仓位还在但保护没了），分别发不同的告警内容。"""
+    symbols_with_stop = [s for s, v in state.items() if v.get('stop', {}).get('algo_id')]
+    if not symbols_with_stop:
+        return
+
+    open_algo_orders = acct_conf.bn.get_swap_algo_open_orders()
+    open_algo_ids = {str(o.get('algoId')) for o in open_algo_orders}
+
+    for symbol in symbols_with_stop:
+        stop = state[symbol]['stop']
+        if str(stop['algo_id']) in open_algo_ids:
+            continue
+
+        position_df = acct_conf.bn.get_swap_position_df()
+        position_amt = float(position_df.loc[symbol, '当前持仓量']) if symbol in position_df.index else 0.0
+        if position_amt <= 0:
+            msg = f'【止损触发】{symbol} 止损条件单已消失，持仓已平（stopPrice={stop["stop_price"]}）'
+            logger.ok(msg)
+        else:
+            msg = (f'【止损异常】{symbol} 止损条件单消失但仓位仍在（{position_amt}），'
+                  f'可能被误撤，等待下一次整点重建恢复保护')
+            logger.warning(msg)
+        send_wechat_work_msg(msg, acct_conf.wechat_webhook_url)
+
+        state[symbol].pop('stop', None)
+        if not state[symbol].get('orders') and not state[symbol].get('stop'):
+            state.pop(symbol, None)
 
 
 def run_cycle(acct_conf, state: dict, run_time: datetime):
@@ -379,6 +610,9 @@ def run_cycle(acct_conf, state: dict, run_time: datetime):
     # ---- 清场，给主程序让路 ----
     logger.info(f'距离 {run_time:%Y-%m-%d %H:%M} 主程序调仓还剩 {CANCEL_LEAD_MINUTES} 分钟，丁针清场')
     clear_ladders(acct_conf, state)
+    # 注意：止损条件单不在这里清场。止盈单让路是为了不占用主程序调仓时的下单额度；
+    # 止损单是保险，提前撤掉会让调仓这几分钟的窗口裸奔在没有保护的状态下，所以保留到调仓完成、
+    # 新持仓确定之后，再跟 rebuild_stop_orders 一起统一撤旧挂新（见下方）。
 
     # ---- 等待调仓完成信号 ----
     got_signal = wait_for_completion(acct_conf, run_time, deadline)
@@ -393,6 +627,13 @@ def run_cycle(acct_conf, state: dict, run_time: datetime):
 
     # ---- 按当前真实持仓重建整条阶梯 ----
     rebuild_ladders(acct_conf, state)
+
+    # ---- 止损条件单：先撤旧的（此时新仓位已经确定），再按新持仓判定 is_crash 挂新的 ----
+    # 顺序不可颠倒：先撤后挂，否则旧的 closePosition=true 条件单可能作用在调仓后的新仓位/新方向上。
+    if STOP_LOSS_ENABLED:
+        clear_stop_orders(acct_conf, state)
+        rebuild_stop_orders(acct_conf, state)
+
     if DRY_RUN:
         logger.info(f'[干跑] 本周期计算结果（不落盘）：{json.dumps(state, ensure_ascii=False, indent=2)}')
     else:

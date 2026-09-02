@@ -1110,6 +1110,105 @@ class BinanceClient:
         send_msg_for_order([params], [order_res], self.wechat_webhook_url)
         return order_res
 
+    # ====================================================================================================
+    # ** 合约条件单（Algo Order） **
+    # 2025-12-09 币安强制迁移：STOP_MARKET/TAKE_PROFIT_MARKET 等条件单不再支持走 /fapi/v1/order 下单，
+    # 必须改用独立的 /fapi/v1/algoOrder 系列接口（下单/查询/撤单）。这几个 path 目前不在 ccxt 的
+    # implicit API 定义表里（没有 fapiprivate_post_algoorder 这种隐式方法名），所以不能像其它下单
+    # 接口那样 getattr(self.exchange, 'xxx')，改用 self.exchange.request(path, api, method, params)
+    # 直接构造签名请求——ccxt 的 sign()/fetch2() 对未注册的 path 一样能正确签名，已单独验证过。
+    # 只在普通账户（fapi）下实现；统一账户（papi）走的是完全不同的 endpoint，本次不接入，见下方保护判断。
+    # ====================================================================================================
+    def _assert_standard_account_for_algo_order(self):
+        # papi（统一账户）的 open_orders 接口名前缀是 papi_get_um_openorders，据此判断账户类型
+        if self.constants.get('get_swap_open_orders_api', '').startswith('papi'):
+            raise NotImplementedError('合约条件单（algoOrder）目前只对接了普通账户（fapi），统一账户（papi）未实现')
+
+    def place_swap_algo_order(self, symbol, side, stop_price, close_position=True,
+                              working_type='CONTRACT_PRICE', **kwargs) -> dict:
+        """
+        挂一张合约条件止损单（STOP_MARKET），走新版 Algo Order 接口。
+        :param symbol: 合约symbol，如 BTCUSDT
+        :param side: 'SELL'（平多）或 'BUY'（平空）
+        :param stop_price: 触发价
+        :param close_position: True 时 closePosition=true，触发后平掉该symbol当前全部合约仓位，
+                                不能再传 quantity；单向持仓模式下 closePosition 不能和 reduceOnly 同传。
+        :param working_type: 触发价格基准，CONTRACT_PRICE（最新成交价）或 MARK_PRICE（标记价）
+        """
+        self._assert_standard_account_for_algo_order()
+        divider(f'`{symbol}` 合约条件止损单 {side} stopPrice={stop_price}', '.')
+
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': 'STOP_MARKET',
+            'stopPrice': str(stop_price),
+            'workingType': working_type,
+            'positionSide': 'BOTH',  # 单向持仓模式固定 BOTH
+            'timestamp': '',
+            **kwargs,
+        }
+        if close_position:
+            params['closePosition'] = 'true'
+        else:
+            params.setdefault('reduceOnly', 'true')
+
+        def _place(params):
+            return self.exchange.request('algoOrder', 'fapiPrivate', 'POST', params)
+
+        try:
+            logger.info(f'合约条件止损单下单参数：{params}')
+            order_res = retry_wrapper(_place, params=params, func_name='合约条件止损单下单',
+                                      retry_times=3, sleep_seconds=2)
+            logger.ok(f'合约条件止损单下单完成，结果：{order_res}')
+        except Exception as e:
+            logger.error(f'合约条件止损单下单出错：{e}')
+            send_wechat_work_msg(f'合约 {symbol} 条件止损单下单出错，请查看程序日志', self.wechat_webhook_url)
+            return {}
+        return order_res
+
+    def get_swap_algo_open_orders(self, symbol=None) -> list:
+        """查询当前合约条件单挂单（algoStatus=NEW），不传 symbol 则查全部"""
+        self._assert_standard_account_for_algo_order()
+        params = {'timestamp': ''}
+        if symbol:
+            params['symbol'] = symbol
+
+        def _get(params):
+            return self.exchange.request('algoOrder', 'fapiPrivate', 'GET', params)
+
+        try:
+            result = retry_wrapper(_get, params=params, func_name='查询合约条件单', retry_times=3, sleep_seconds=2)
+        except Exception as e:
+            logger.error(f'查询合约条件单出错：{e}')
+            return []
+        if isinstance(result, dict):
+            result = result.get('orders', result.get('algoOrders', []))
+        return result or []
+
+    def cancel_swap_algo_order(self, symbol, algo_id=None, client_algo_id=None) -> dict:
+        """撤销一张合约条件单，algo_id / client_algo_id 二选一必传"""
+        self._assert_standard_account_for_algo_order()
+        if not algo_id and not client_algo_id:
+            raise ValueError('cancel_swap_algo_order 需要 algo_id 或 client_algo_id 二选一')
+
+        params = {'symbol': symbol, 'timestamp': ''}
+        if algo_id:
+            params['algoId'] = str(algo_id)
+        else:
+            params['clientAlgoId'] = str(client_algo_id)
+
+        def _cancel(params):
+            return self.exchange.request('algoOrder', 'fapiPrivate', 'DELETE', params)
+
+        try:
+            result = retry_wrapper(_cancel, params=params, func_name='撤销合约条件单', retry_times=3, sleep_seconds=2)
+            logger.info(f'{symbol} 条件止损单已撤销：{algo_id or client_algo_id}')
+            return result
+        except Exception as e:
+            logger.error(f'{symbol} 撤销条件止损单出错：{e}')
+            return {}
+
     def transfer_u_from_spot_to_swap(self, amount):
         raise NotImplementedError
 
