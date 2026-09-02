@@ -78,8 +78,9 @@ TERMINAL_ORDER_STATUS = ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH') 
 # ++++ is_crash 期间合约多头单K止损 ++++
 # 背景见 docs（研究结论）：is_crash 期间的多头，若单根K线跌幅过深，加一道交易所侧的条件止损，
 # 把左尾损失截断在阈值附近。只做多头止损——对称的空头止损（暴涨止损）已经过代理估算验证是灾难性的，
-# 绝对不要加。默认关闭，开关式上线。
-STOP_LOSS_ENABLED = False   # 总开关，默认关闭
+# 绝对不要加。2026-09-02 已用 calibrate_algo_order.py 在真实账户上校准过下单/查询/撤单三个接口
+# （见该脚本注释里链的 plan 文档），全部通过，正式开启。
+STOP_LOSS_ENABLED = True    # 总开关
 CRASH_WINDOW = 144          # is_crash 判定窗口（小时），注意不是 Acc_reverse_v3 因子出厂默认的96小时
 CRASH_THRESHOLD = -0.10     # 窗口内只要有一根K线跌幅低于此阈值，即判定为 is_crash
 STOP_DROP = 0.12            # 止损线：相对上一根已收盘K线收盘价的跌幅
