@@ -85,40 +85,55 @@ def main(account_name: str, symbol: str = None):
         return
     logger.ok(f'下单成功，algoId={algo_id}')
 
-    # ---- 2. 查询 ----
-    divider('2. 查询 get_swap_algo_open_orders', '-')
-    open_orders = bn.get_swap_algo_open_orders(symbol)
-    print(f'原始返回：{open_orders}')
-    found = any(str(o.get('algoId')) == str(algo_id) for o in open_orders)
-    results['查询能看到刚下的条件单'] = found
-    if found:
-        logger.ok('查询到刚下的条件单')
-    else:
-        logger.warning('没有在挂单列表里查到刚下的条件单，字段名可能对不上（比如不是 algoId），看上面原始返回')
+    # 从这里开始任何一步都可能抛异常（比如 cancel_all_swap_orders 内部 retry_wrapper 耗尽重试后
+    # 直接 raise）。上一次校准就是卡在中间某一步导致脚本整体退出，测试单一直挂在账户上，
+    # 靠人工手动撤掉的——所以这里全程包一层 try/finally，不管中途哪一步炸了，
+    # finally 都会补一次撤单，不依赖流程走到第4步才清理。
+    cleaned_up = False
+    try:
+        # ---- 2. 查询 ----
+        divider('2. 查询 get_swap_algo_open_orders', '-')
+        open_orders = bn.get_swap_algo_open_orders(symbol)
+        print(f'原始返回：{open_orders}')
+        found = any(str(o.get('algoId')) == str(algo_id) for o in open_orders)
+        results['查询能看到刚下的条件单'] = found
+        if found:
+            logger.ok('查询到刚下的条件单')
+        else:
+            logger.warning('没有在挂单列表里查到刚下的条件单，字段名可能对不上（比如不是 algoId），看上面原始返回')
 
-    # ---- 3. 验证 cancel_all_swap_orders 撤不掉它（隔离性） ----
-    divider('3. 验证普通撤单接口不会误撤条件单', '-')
-    bn.cancel_all_swap_orders(symbol_list=[symbol])
-    open_orders_after = bn.get_swap_algo_open_orders(symbol)
-    still_there = any(str(o.get('algoId')) == str(algo_id) for o in open_orders_after)
-    results['cancel_all_swap_orders 未误撤条件单'] = still_there
-    if still_there:
-        logger.ok('cancel_all_swap_orders 确认撤不掉条件单，两套挂单命名空间是隔离的')
-    else:
-        logger.error('condition单被 cancel_all_swap_orders 误撤了！这会导致主循环调仓时把止损单一起撤掉，'
-                     '需要重新设计撤单隔离方案，不能直接用现在这套')
+        # ---- 3. 验证 cancel_all_swap_orders 撤不掉它（隔离性） ----
+        divider('3. 验证普通撤单接口不会误撤条件单', '-')
+        bn.cancel_all_swap_orders(symbol_list=[symbol])
+        open_orders_after = bn.get_swap_algo_open_orders(symbol)
+        still_there = any(str(o.get('algoId')) == str(algo_id) for o in open_orders_after)
+        results['cancel_all_swap_orders 未误撤条件单'] = still_there
+        if still_there:
+            logger.ok('cancel_all_swap_orders 确认撤不掉条件单，两套挂单命名空间是隔离的')
+        else:
+            logger.error('condition单被 cancel_all_swap_orders 误撤了！这会导致主循环调仓时把止损单一起撤掉，'
+                         '需要重新设计撤单隔离方案，不能直接用现在这套')
 
-    # ---- 4. 撤销 ----
-    divider('4. 撤销 cancel_swap_algo_order', '-')
-    cancel_res = bn.cancel_swap_algo_order(symbol, algo_id=algo_id)
-    print(f'原始返回：{cancel_res}')
-    open_orders_final = bn.get_swap_algo_open_orders(symbol)
-    gone = not any(str(o.get('algoId')) == str(algo_id) for o in open_orders_final)
-    results['撤销后确认已清除'] = gone
-    if gone:
-        logger.ok('撤销成功，已确认清除')
-    else:
-        logger.error('撤销后仍能查到该条件单，请手动登录交易所APP/网页确认并手动撤销！')
+        # ---- 4. 撤销 ----
+        divider('4. 撤销 cancel_swap_algo_order', '-')
+        cancel_res = bn.cancel_swap_algo_order(symbol, algo_id=algo_id)
+        print(f'原始返回：{cancel_res}')
+        open_orders_final = bn.get_swap_algo_open_orders(symbol)
+        gone = not any(str(o.get('algoId')) == str(algo_id) for o in open_orders_final)
+        results['撤销后确认已清除'] = gone
+        cleaned_up = gone
+        if gone:
+            logger.ok('撤销成功，已确认清除')
+        else:
+            logger.error('撤销后仍能查到该条件单，请手动登录交易所APP/网页确认并手动撤销！')
+    finally:
+        if not cleaned_up:
+            logger.warning(f'安全网触发：补一次撤单，避免中途异常导致孤儿单遗留（algoId={algo_id}）')
+            try:
+                bn.cancel_swap_algo_order(symbol, algo_id=algo_id)
+                logger.ok('安全网撤单已发出（不保证一定成功，建议手动去交易所确认一遍）')
+            except Exception as cleanup_err:
+                logger.error(f'安全网撤单也失败了，请务必手动登录交易所检查并撤销 algoId={algo_id}：{cleanup_err}')
 
     print_summary(results)
 

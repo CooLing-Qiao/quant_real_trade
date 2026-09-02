@@ -1169,22 +1169,25 @@ class BinanceClient:
         return order_res
 
     def get_swap_algo_open_orders(self, symbol=None) -> list:
-        """查询当前合约条件单挂单（algoStatus=NEW），不传 symbol 则查全部"""
+        """
+        查询当前合约条件单挂单列表，不传 symbol 则查全部。
+        注意：这个"列表查询"是独立的 GET /fapi/v1/openAlgoOrders 接口，跟"查询单个订单"的
+        GET /fapi/v1/algoOrder 是两个不同的 path——实测已确认后者不传 algoId/clientAlgoId 会直接
+        报错（跟旧版 GET /fapi/v1/order 语义一致，都是"query one order"，不是"list open orders"）。
+        """
         self._assert_standard_account_for_algo_order()
         params = {'timestamp': ''}
         if symbol:
             params['symbol'] = symbol
 
         def _get(params):
-            return self.exchange.request('algoOrder', 'fapiPrivate', 'GET', params)
+            return self.exchange.request('openAlgoOrders', 'fapiPrivate', 'GET', params)
 
         try:
-            result = retry_wrapper(_get, params=params, func_name='查询合约条件单', retry_times=3, sleep_seconds=2)
+            result = retry_wrapper(_get, params=params, func_name='查询合约条件单列表', retry_times=3, sleep_seconds=2)
         except Exception as e:
-            logger.error(f'查询合约条件单出错：{e}')
+            logger.error(f'查询合约条件单列表出错：{e}')
             return []
-        if isinstance(result, dict):
-            result = result.get('orders', result.get('algoOrders', []))
         return result or []
 
     def cancel_swap_algo_order(self, symbol, algo_id=None, client_algo_id=None) -> dict:
