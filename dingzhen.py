@@ -32,10 +32,10 @@
 
 is_crash 期间合约多头单K止损（STOP_LOSS_ENABLED，默认关闭）：
 - 只做多头止损，不做对称的空头止损（暴涨止损）——已经过代理估算验证是灾难性的，绝对不要加。
-- is_crash 独立按持仓币自己的K线重新判定（过去 CRASH_WINDOW=144 小时内出现过单根跌幅低于
-  CRASH_THRESHOLD 的暴跌），跟 factors/Acc_reverse_v3.py 里的同名概念判定逻辑一致但窗口不同；
-  本账户实际持有多头的子策略（Acc_reverse/Trix）都不引用 Acc_reverse_v3，没有现成的 is_crash
-  可以直接复用。
+- is_crash 独立按持仓币自己的K线重新判定（过去 CRASH_WINDOW 小时内出现过单根跌幅低于
+  CRASH_THRESHOLD 的暴跌），判定逻辑跟 factors/Acc_reverse_v3.py 里的同名概念一致，窗口目前
+  跟该因子出厂默认（96小时）保持一致；本账户实际持有多头的子策略（Acc_reverse/Trix）都不
+  引用 Acc_reverse_v3，没有现成的 is_crash 可以直接复用，只能独立按持仓币重新算一遍。
 - 止损用交易所侧的条件单（STOP_MARKET + closePosition=true），不是本地轮询：普通限价单挂在
   不利方向会被立即撮合，做不了止损；本地轮询的延迟又恰好打在最该保护的场景（瀑布行情常常几分钟
   内走完）。2025-12-09 币安把条件单强制迁移到独立的 /fapi/v1/algoOrder 接口（不再支持走
@@ -65,8 +65,8 @@ from core.utils.path_kit import get_file_path
 # ====================================================================================================
 # ** 配置 **
 # ====================================================================================================
-LADDER_LEVELS_LONG = [0.45, 0.60]   # 多头止盈档位（盈利比例）
-LADDER_LEVELS_SHORT = [0.25, 0.35]  # 空头止盈档位（盈利比例）
+LADDER_LEVELS_LONG = [0.45, 0.60, 0.75]   # 多头止盈档位（盈利比例）
+LADDER_LEVELS_SHORT = [0.25, 0.35, 0.45]  # 空头止盈档位（盈利比例）
 
 CANCEL_LEAD_MINUTES = 5    # 主程序预计下单前多少分钟撤单清场
 WAIT_TIMEOUT_MINUTES = 20  # 等不到调仓完成信号，多久后兜底直接重建
@@ -81,9 +81,9 @@ TERMINAL_ORDER_STATUS = ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH') 
 # 绝对不要加。2026-09-02 已用 calibrate_algo_order.py 在真实账户上校准过下单/查询/撤单三个接口
 # （见该脚本注释里链的 plan 文档），全部通过，正式开启。
 STOP_LOSS_ENABLED = True    # 总开关
-CRASH_WINDOW = 144          # is_crash 判定窗口（小时），注意不是 Acc_reverse_v3 因子出厂默认的96小时
+CRASH_WINDOW = 96           # is_crash 判定窗口（小时），跟 Acc_reverse_v3 因子出厂默认一致
 CRASH_THRESHOLD = -0.10     # 窗口内只要有一根K线跌幅低于此阈值，即判定为 is_crash
-STOP_DROP = 0.12            # 止损线：相对上一根已收盘K线收盘价的跌幅
+STOP_DROP = 0.25            # 止损线：相对上一根已收盘K线收盘价的跌幅
 STOP_WORKING_TYPE = 'CONTRACT_PRICE'  # 条件单触发价格基准，跟回测口径（用K线价格）对齐，不用标记价
 
 DRY_RUN = False  # 干跑模式开关，由 --dry-run 命令行参数设置，见文件末尾
