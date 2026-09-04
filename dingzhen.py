@@ -68,7 +68,7 @@ from core.utils.path_kit import get_file_path
 LADDER_LEVELS_LONG = [0.45, 0.60, 0.75]   # 多头止盈档位（盈利比例）
 LADDER_LEVELS_SHORT = [0.25, 0.35, 0.45]  # 空头止盈档位（盈利比例）
 
-CANCEL_LEAD_MINUTES = 5    # 主程序预计下单前多少分钟撤单清场
+CANCEL_LEAD_MINUTES = 1    # 主程序预计下单前多少分钟撤单清场
 WAIT_TIMEOUT_MINUTES = 20  # 等不到调仓完成信号，多久后兜底直接重建
 SETTLE_SECONDS = 20        # 看到完成信号后静置多久再读持仓（让最后的成交/结算落定）
 POLL_SECONDS = 15          # 清场前/等待信号期间的健康检查 & 轮询间隔
