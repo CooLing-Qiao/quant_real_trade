@@ -729,7 +729,7 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
             sub_stg_equity['candle_begin_time'] = sub_stg_equity['candle_begin_time'].dt.tz_localize(None) + time_diff
             sub_stg_eqs[conf.name] = sub_stg_equity
         pd.to_pickle(sub_stg_eqs, sub_stg_eqs_path)
-        return
+        return equity_df
 
     # =画图
     fig, (ax1, ax3, ax4, ax5, ax6, ax7) = plt.subplots(6, 1, figsize=(12, 16), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 3]})
@@ -964,7 +964,7 @@ def save_and_send_equity_info(account_config: AccountConfig, me_conf, spot_posit
         transfer_df = get_and_save_local_transfer(transfer_df, transfer_path)
         # =构建上线后所有数据
         equity_df0 = equity_df_temp.copy()
-        draw_equity_and_send_pic(me_conf, equity_df0, transfer_df, 'equity-curve(All days)', account_config, is_send=False)
+        full_hist_df = draw_equity_and_send_pic(me_conf, equity_df0, transfer_df, 'equity-curve(All days)', account_config, is_send=False)
         # =构建近30天数据
         duration = '720h'
         equity_df1 = equity_df_temp[equity_df_temp['time'] >= equity_df_temp['time'].max() - pd.to_timedelta(duration)].reset_index(drop=True)
@@ -981,6 +981,7 @@ def save_and_send_equity_info(account_config: AccountConfig, me_conf, spot_posit
         max_all_equity = np.nan  # 历史最高为nan
         min_all_equity = np.nan  # 历史最低为nan
         equity_df = new_equity_df
+        full_hist_df = None  # 第一次运行，还没有历史数据，跳过净值法历史最高/回撤统计
 
     # =构建推送消息内容
     equity_msg = f'账户净值： {new_equity_df.loc[0, "账户总净值"]:.2f}\n'
@@ -1002,10 +1003,32 @@ def save_and_send_equity_info(account_config: AccountConfig, me_conf, spot_posit
     equity_msg += f'历史最高账户总净值：{max_all_equity}\n'  # 记录历史最高账户净值
     equity_msg += f'历史最低账户总净值：{min_all_equity}\n'  # 记录历史最低账户净值
 
+    if full_hist_df is not None and not full_hist_df.empty:
+        # =净值法（份额法）口径的全历史最高净值、当前回撤、峰值以来最大回撤
+        # full_hist_df 由 draw_equity_and_send_pic(..., is_send=False) 对全部历史（含转入转出）跑一遍 net_fund 得到，
+        # 净值/dd2here 都是expanding口径：peak_idx 之后 max2here 恒等于全局峰值，所以这段区间内 dd2here 的最小值
+        # 就是"峰值以来最大回撤"，dd2here 的最后一个值就是"当前较峰值回撤"
+        peak_idx = full_hist_df['净值'].idxmax()
+        peak_time = full_hist_df.loc[peak_idx, 'time']
+        peak_net_value = full_hist_df.loc[peak_idx, '净值']
+        current_dd = full_hist_df.iloc[-1]['dd2here']
+        max_dd_since_peak = full_hist_df.loc[peak_idx:, 'dd2here'].min()
+
+        equity_msg += f'净值法历史最高净值：{peak_net_value:.4f}（发生于 {peak_time:%Y-%m-%d %H:%M}）\n'
+        equity_msg += f'当前较历史最高净值回撤：{current_dd:.2f}%\n'
+        equity_msg += f'历史最高净值到当前区间内的最大回撤：{max_dd_since_peak:.2f}%\n'
+
     # 记录多头仓位、多头现货、多头合约、空头仓位
     equity_msg += f'现货USDT余额：{spot_usdt}\n'  # 记录历史USDT净值
     equity_msg += f'多头仓位：{new_equity_df.loc[0, "多头仓位"]:.2f}（spot {new_equity_df.loc[0, "多头现货"]:.2f}, swap {new_equity_df.loc[0, "多头合约"]:.2f}）\n'
     equity_msg += f'空头仓位：{new_equity_df.loc[0, "空头仓位"]:.2f}\n'
+
+    # ===计算净杠杆：净敞口（多头仓位 + 空头仓位，空头仓位本身已是负数，两者相加即多空对冲后的方向性敞口）
+    # 除以账户总净值（保证金的近似口径，全仓/统一账户下净值即保证金基础），跟 account_config.leverage 这个"设定杠杆"是两个概念——
+    # 这里算的是多空对冲后实际还剩多少方向性风险，不是仓位总规模
+    net_exposure = new_equity_df.loc[0, "多头仓位"] + new_equity_df.loc[0, "空头仓位"]
+    net_leverage = net_exposure / account_equity if account_equity else 0
+    equity_msg += f'净杠杆（净敞口/账户总净值）：{net_leverage:.2f}\n'  # 记录净杠杆
 
     # ===计算账户保证金率
     # total_equity = swap_equity + swap_position['持仓盈亏'].sum()  # 计算当前账户总净值（含未实现盈亏）
