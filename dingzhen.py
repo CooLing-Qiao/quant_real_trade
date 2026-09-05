@@ -30,11 +30,15 @@
 - 两次重建之间（挂单存续期）会持续做健康检查：每笔挂单按 orderId 核对交易所真实状态，
   FILLED 就发通知，被意外撤单（CANCELED 等终态）就原样挂回。
 
-is_crash 期间合约多头单K止损（STOP_LOSS_ENABLED，默认关闭）：
+is_spike 期间合约多头单K止损（STOP_LOSS_ENABLED，默认关闭）：
 - 只做多头止损，不做对称的空头止损（暴涨止损）——已经过代理估算验证是灾难性的，绝对不要加。
-- is_crash 独立按持仓币自己的K线重新判定（过去 CRASH_WINDOW 小时内出现过单根跌幅低于
-  CRASH_THRESHOLD 的暴跌），判定逻辑跟 factors/Acc_reverse_v3.py 里的同名概念一致，窗口目前
-  跟该因子出厂默认（96小时）保持一致；本账户实际持有多头的子策略（Acc_reverse/Trix）都不
+  注意：下面的 is_spike 判定条件本身是"暴涨"（单根K线涨幅超过阈值），但触发后的动作仍然只是
+  给多头仓位挂一张下方止损单（截断多头后续可能的回落损失），不是给空头加止损，跟上面这条禁令
+  不冲突。
+- is_spike 独立按持仓币自己的K线重新判定（过去 SPIKE_WINDOW 小时内出现过单根涨幅高于
+  SPIKE_THRESHOLD 的暴涨）。这个概念最初是从 factors/Acc_reverse_v3.py 里基于跌幅的 is_crash
+  改造来的（窗口沿用其默认值 96小时），但判定方向已改为涨幅、跟该因子原本的 is_crash 定义不再
+  一致，所以本地改名为 is_spike 加以区分；本账户实际持有多头的子策略（Acc_reverse/Trix）都不
   引用 Acc_reverse_v3，没有现成的 is_crash 可以直接复用，只能独立按持仓币重新算一遍。
 - 止损用交易所侧的条件单（STOP_MARKET + closePosition=true），不是本地轮询：普通限价单挂在
   不利方向会被立即撮合，做不了止损；本地轮询的延迟又恰好打在最该保护的场景（瀑布行情常常几分钟
@@ -75,15 +79,15 @@ POLL_SECONDS = 15          # 清场前/等待信号期间的健康检查 & 轮�
 
 TERMINAL_ORDER_STATUS = ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH')  # 视为"被撤单"的订单终态
 
-# ++++ is_crash 期间合约多头单K止损 ++++
-# 背景见 docs（研究结论）：is_crash 期间的多头，若单根K线跌幅过深，加一道交易所侧的条件止损，
+# ++++ is_spike 期间合约多头单K止损 ++++
+# 背景见 docs（研究结论）：is_spike 期间的多头，若单根K线跌幅过深，加一道交易所侧的条件止损，
 # 把左尾损失截断在阈值附近。只做多头止损——对称的空头止损（暴涨止损）已经过代理估算验证是灾难性的，
 # 绝对不要加。2026-09-02 已用 calibrate_algo_order.py 在真实账户上校准过下单/查询/撤单三个接口
 # （见该脚本注释里链的 plan 文档），全部通过，正式开启。
 STOP_LOSS_ENABLED = True    # 总开关
-CRASH_WINDOW = 96           # is_crash 判定窗口（小时），跟 Acc_reverse_v3 因子出厂默认一致
-CRASH_THRESHOLD = -0.10     # 窗口内只要有一根K线跌幅低于此阈值，即判定为 is_crash
-STOP_DROP = 0.25            # 止损线：相对上一根已收盘K线收盘价的跌幅
+SPIKE_WINDOW = 96           # is_spike 判定窗口（小时），窗口长度跟 Acc_reverse_v3 因子的 crash_window 出厂默认一致
+SPIKE_THRESHOLD = 0.25      # 窗口内只要有一根K线涨幅高于此阈值，即判定为 is_spike（本地概念，跟 Acc_reverse_v3 里基于跌幅的 is_crash 判定方向相反）
+STOP_DROP = 0.3             # 止损线：相对上一根已收盘K线收盘价的跌幅
 STOP_WORKING_TYPE = 'CONTRACT_PRICE'  # 条件单触发价格基准，跟回测口径（用K线价格）对齐，不用标记价
 
 DRY_RUN = False  # 干跑模式开关，由 --dry-run 命令行参数设置，见文件末尾
@@ -176,9 +180,9 @@ def get_recent_closed_closes(acct_conf, symbol: str, limit: int) -> list:
     """
     获取该币最近 limit 根【已收盘】1小时K线的收盘价，按时间升序排列。
     跟 get_current_hour_open 用同一个公开行情接口（fapipublic_get_klines），多请求2根做缓冲，
-    并且无条件丢弃最后一根——交易所返回的最后一根可能是正在走的当前小时K线，is_crash 的判定口径
-    （factors/Acc_reverse_v3.py）只用"已经走完"的K线，混进还在变化的最新数据会让判定在盘中反复
-    开关，产生毛刺。
+    并且无条件丢弃最后一根——交易所返回的最后一根可能是正在走的当前小时K线，is_spike 的判定口径
+    （沿用 factors/Acc_reverse_v3.py 里 is_crash 的做法）只用"已经走完"的K线，混进还在变化的最新
+    数据会让判定在盘中反复开关，产生毛刺。
     """
     bn = acct_conf.bn
     try:
@@ -194,20 +198,19 @@ def get_recent_closed_closes(acct_conf, symbol: str, limit: int) -> list:
     return [float(k[4]) for k in closed[-limit:]]  # K线字段顺序：4=close
 
 
-def is_crash_symbol(closes: list) -> bool:
+def is_spike_symbol(closes: list) -> bool:
     """
-    过去 CRASH_WINDOW 根已收盘K线内，是否出现过单根跌幅低于 CRASH_THRESHOLD 的暴跌。
-    判定逻辑跟 factors/Acc_reverse_v3.py 里的 is_crash 完全一致
-    （min_change = close.pct_change().rolling(window, min_periods=1).min(); is_crash = min_change < 阈值），
-    只是这里独立维护、窗口用 CRASH_WINDOW=144小时（而不是该因子出厂默认的96小时）——本账户实际
-    持有多头的子策略是 Acc_reverse/Trix，都不引用 Acc_reverse_v3，没有现成的 is_crash 可以直接复用，
-    只能按持仓币自己的K线重新算一遍。
+    过去 SPIKE_WINDOW 根已收盘K线内，是否出现过单根涨幅高于 SPIKE_THRESHOLD 的暴涨。
+    跟 factors/Acc_reverse_v3.py 里基于跌幅的 is_crash 不同——这里判定方向改为涨幅，
+    用来识别"最近暴涨过"的多头持仓，进而挂一道下方止损保护后续可能的回落。窗口独立维护，
+    跟该因子出厂默认窗口（96小时）保持一致；本账户实际持有多头的子策略是 Acc_reverse/Trix，
+    都不引用 Acc_reverse_v3，没有现成的 is_crash 可以直接复用，只能按持仓币自己的K线重新算一遍。
     :param closes: 按时间升序排列的已收盘K线收盘价
     """
     if len(closes) < 2:
         return False
     pct_change = pd.Series(closes, dtype='float64').pct_change()
-    return bool((pct_change < CRASH_THRESHOLD).any())
+    return bool((pct_change > SPIKE_THRESHOLD).any())
 
 
 def build_stop_plan(prev_close: float, position_amt: float, price_precision: int) -> dict | None:
@@ -498,7 +501,7 @@ def wait_for_completion(acct_conf, run_time: datetime, deadline: datetime) -> bo
 
 
 # ====================================================================================================
-# ** is_crash 期间合约多头单K止损 **
+# ** is_spike 期间合约多头单K止损 **
 # ====================================================================================================
 def clear_stop_orders(acct_conf, state: dict):
     """撤掉上一小时挂的全部止损条件单。先按 state 里记录的 algoId 精确撤，再用交易所侧的条件单
@@ -532,7 +535,7 @@ def clear_stop_orders(acct_conf, state: dict):
 
 
 def rebuild_stop_orders(acct_conf, state: dict):
-    """按当前真实持仓，对净持仓为多头且命中 is_crash 的币重新挂止损条件单。
+    """按当前真实持仓，对净持仓为多头且命中 is_spike 的币重新挂止损条件单。
     必须在 clear_stop_orders 之后调用——顺序颠倒会导致新一轮的止损单被自己紧接着撤掉。"""
     position_df = acct_conf.bn.get_swap_position_df()
     if position_df.empty:
@@ -547,8 +550,8 @@ def rebuild_stop_orders(acct_conf, state: dict):
             if position_amt <= 0:
                 continue  # 只做多头止损，空头/无持仓不处理
 
-            closes = get_recent_closed_closes(acct_conf, symbol, CRASH_WINDOW)
-            if not closes or not is_crash_symbol(closes):
+            closes = get_recent_closed_closes(acct_conf, symbol, SPIKE_WINDOW)
+            if not closes or not is_spike_symbol(closes):
                 continue
 
             price_precision = market_info['price_precision'].get(symbol, 4)
@@ -563,7 +566,7 @@ def rebuild_stop_orders(acct_conf, state: dict):
 
             state.setdefault(symbol, {})['stop'] = order
             verb = '（干跑）计算出' if DRY_RUN else '已挂出'
-            logger.ok(f'{symbol} is_crash 命中，{verb}止损单，stopPrice={plan["stop_price"]}')
+            logger.ok(f'{symbol} is_spike 命中，{verb}止损单，stopPrice={plan["stop_price"]}')
         except Exception as e:
             logger.error(f'{symbol} 重建止损单出错：{e}')
             logger.debug(traceback.format_exc())
@@ -571,7 +574,7 @@ def rebuild_stop_orders(acct_conf, state: dict):
 
 def health_check_stop_orders(acct_conf, state: dict):
     """止损条件单巡检：跟丁针止盈单不同，止损单不需要"被撤就挂回"（重挂的判断依赖当时的持仓和
-    is_crash 状态，只在整点 rebuild_stop_orders 里做一次即可，没必要在巡检里高频重算）。
+    is_spike 状态，只在整点 rebuild_stop_orders 里做一次即可，没必要在巡检里高频重算）。
     这里做两件事：1）尽早发现某张止损单"消失了"，区分是正常触发（仓位已平）还是异常丢失
     （仓位还在但保护没了），分别发不同的告警内容；2）如果是正常触发，主动撤掉这个symbol上
     残留的止盈限价单（丁针的ladder orders）——不假设币安会在仓位归零时自动撤掉同symbol的
@@ -642,7 +645,7 @@ def run_cycle(acct_conf, state: dict, run_time: datetime):
     # ---- 按当前真实持仓重建整条阶梯 ----
     rebuild_ladders(acct_conf, state)
 
-    # ---- 止损条件单：先撤旧的（此时新仓位已经确定），再按新持仓判定 is_crash 挂新的 ----
+    # ---- 止损条件单：先撤旧的（此时新仓位已经确定），再按新持仓判定 is_spike 挂新的 ----
     # 顺序不可颠倒：先撤后挂，否则旧的 closePosition=true 条件单可能作用在调仓后的新仓位/新方向上。
     if STOP_LOSS_ENABLED:
         clear_stop_orders(acct_conf, state)
