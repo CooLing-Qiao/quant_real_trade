@@ -44,11 +44,12 @@ strategy_pool = [
         name='动量超混策略',
         strategy_list=[
     {
+        # 第三轮权重，见 research/optimization_round3/RESULTS.md（同步自 config.py，2026-09-07）
         "strategy": "Strategy_Acc多头_89",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.204,
+        'cap_weight': 0.15600000000000003,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -69,7 +70,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.204,
+        'cap_weight': 0.23399999999999999,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -80,6 +81,7 @@ strategy_pool = [
         "long_filter_list": [],
         "long_filter_list_post": [
             ('DrawdownFromHigh', 400, 'val:>-0.30', False),
+            ('VolumeMeanRatio', 24, 'val:>0.5', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -90,7 +92,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.32,
+        'cap_weight': 0.21,
         'long_cap_weight': 0,
         'short_cap_weight': 1,
         'long_select_coin_num': 0,
@@ -111,7 +113,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.068,
+        'cap_weight': 0.13,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -123,6 +125,7 @@ strategy_pool = [
         "long_filter_list_post": [
             ('DrawdownFromHigh', 6, 'val:>-0.30', False),
             ('DrawdownFromHigh', 75, 'val:>-0.55', False),
+            ('RealizedVol', 48, 'val:<0.025', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -133,7 +136,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.068,
+        'cap_weight': 0.13,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -142,9 +145,7 @@ strategy_pool = [
             ('Trix', False, 610, 1),
         ],
         "long_filter_list": [],
-        "long_filter_list_post": [
-            ('DrawdownFromHigh', 67, 'val:>-0.35', False),
-        ],
+        "long_filter_list_post": [],
         "short_filter_list": [],
         "use_custom_func": False
     },
@@ -154,7 +155,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.136,
+        'cap_weight': 0.13999999999999999,
         'long_cap_weight': 0,
         'short_cap_weight': 1,
         'long_select_coin_num': 0,
