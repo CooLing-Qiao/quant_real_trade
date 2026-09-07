@@ -44,7 +44,7 @@ strategy_pool = [
         name='动量超混策略',
         strategy_list=[
     {
-        # 第三轮权重，见 research/optimization_round3/RESULTS.md（同步自 config.py，2026-09-07）
+        # 第六轮过滤配置 + 第三轮权重，见 research/optimization_round6/RESULTS.md（同步自 config.py，2026-09-07）
         "strategy": "Strategy_Acc多头_89",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -59,7 +59,12 @@ strategy_pool = [
         ],
         "long_filter_list": [],
         "long_filter_list_post": [
-            ('DrawdownFromHigh', 18, 'val:>-0.30', False),
+            ('DrawdownFromHigh', 18, 'val:>-0.25', False),
+            ('VolumeMeanRatio', 48, 'val:>0.45', False),
+            ('WickReverse', 24, 'val:<0.016958115', False),
+            ('Cci', 24, 'val:>-36.829517', False),
+            ('VolumeMeanRatio', 168, 'val:>1.0740995', False),
+            ('Rsimean', 24, 'val:>0.38125909', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -81,7 +86,9 @@ strategy_pool = [
         "long_filter_list": [],
         "long_filter_list_post": [
             ('DrawdownFromHigh', 400, 'val:>-0.30', False),
-            ('VolumeMeanRatio', 24, 'val:>0.5', False),
+            ('VolumeMeanRatio', 24, 'val:>0.45', False),
+            ('DrawdownFromHigh', 18, 'val:>-0.25', False),
+            ('DrawdownFromHigh', 168, 'val:>-0.29347055', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -104,6 +111,7 @@ strategy_pool = [
         "short_filter_list": [],
         "short_filter_list_post": [
             ('BounceFromCrashLow', ('v3', -0.35), 'val:<0.55', False),
+            ('VolumeMeanRatio', 48, 'val:>0.45', False),
         ],
         "use_custom_func": False
     },
@@ -126,6 +134,7 @@ strategy_pool = [
             ('DrawdownFromHigh', 6, 'val:>-0.30', False),
             ('DrawdownFromHigh', 75, 'val:>-0.55', False),
             ('RealizedVol', 48, 'val:<0.025', False),
+            ('VolumeMeanRatio', 48, 'val:>0.6', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -145,7 +154,11 @@ strategy_pool = [
             ('Trix', False, 610, 1),
         ],
         "long_filter_list": [],
-        "long_filter_list_post": [],
+        "long_filter_list_post": [
+            ('VolumeMeanRatio', 24, 'val:>0.45', False),
+            ('BounceFromLow', 96, 'val:>0.051909127', False),
+            ('ZfStd', 48, 'val:>0.020861992', False),
+        ],
         "short_filter_list": [],
         "use_custom_func": False
     },
