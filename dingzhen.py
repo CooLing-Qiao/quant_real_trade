@@ -24,13 +24,14 @@
   近似出来的，这样才能跟回测里"用每根K线自己的开盘价做基准，对比止盈拿到的价格与这根K线自己开盘
   到收盘的收益"这套逻辑完全对上。多头 level 取 LADDER_LEVELS_LONG，空头取 LADDER_LEVELS_SHORT
   （多空分开配置，是用这套回测方法挑出来的数据支持的档位，多空表现不对称，不能共用一套）。档位
-  平分当前持仓量。
+  平分当前持仓量。任意一边的档位列表配成空，就等于关掉那一边的止盈——2026-09-07 起空头就是这个
+  状态，原因见下面 LADDER_LEVELS_SHORT 处的说明。
 - 因为每小时都按当时的真实持仓重建，主策略自己加/减仓导致的持仓量变化会自动被下一次重建吸收，
   不需要额外跟踪、校准。
 - 两次重建之间（挂单存续期）会持续做健康检查：每笔挂单按 orderId 核对交易所真实状态，
   FILLED 就发通知，被意外撤单（CANCELED 等终态）就原样挂回。
 
-is_spike 期间合约多头单K止损（STOP_LOSS_ENABLED，默认关闭）：
+is_spike 期间合约多头单K止损（STOP_LOSS_ENABLED，2026-09-07 起已关闭，原因见该配置项处的注释）：
 - 只做多头止损，不做对称的空头止损（暴涨止损）——已经过代理估算验证是灾难性的，绝对不要加。
   注意：下面的 is_spike 判定条件本身是"暴涨"（单根K线涨幅超过阈值），但触发后的动作仍然只是
   给多头仓位挂一张下方止损单（截断多头后续可能的回落损失），不是给空头加止损，跟上面这条禁令
@@ -47,6 +48,10 @@ is_spike 期间合约多头单K止损（STOP_LOSS_ENABLED，默认关闭）：
   get_swap_algo_open_orders / cancel_swap_algo_order。
 - 止损单不跟着止盈单一起在 CANCEL_LEAD_MINUTES 时提前撤（止损是保险，不该在调仓窗口裸奔），
   而是在 rebuild_ladders 之后、每小时统一"先撤旧的、再按新持仓判定挂新的"。
+- 注意撤销（clear_stop_orders）是【无条件执行】的，不受 STOP_LOSS_ENABLED 控制，只有重新挂
+  （rebuild_stop_orders）才看总开关。否则把开关关掉之后，之前挂出去的条件单就再也没人撤，
+  会永远留在账户上；而 closePosition=true 认 symbol 不认方向，这个 symbol 一旦反手做空，
+  孤儿的多头止损单就会在错误的方向上触发平仓。
 - 只对普通账户（fapi）生效，统一账户（papi）未接入。
 """
 
@@ -69,8 +74,18 @@ from core.utils.path_kit import get_file_path
 # ====================================================================================================
 # ** 配置 **
 # ====================================================================================================
-LADDER_LEVELS_LONG = [0.45, 0.60, 0.75]   # 多头止盈档位（盈利比例）
-LADDER_LEVELS_SHORT = [0.25, 0.35, 0.45]  # 空头止盈档位（盈利比例）
+# 2026-09-07 按第七轮优化后的 config.py 六子策略配置重估档位
+# （research/analysis/research_丁针档位_第七轮.py，结论写在该脚本 docstring 里）：
+# - 多头：<0.15 明显负贡献（把该吃的趋势砍断），0.25~0.70 是一片稳定的正贡献高原，
+#   2023-24 / 2025 / 2026 三个子区间全为正，且不靠单次事件（106 次触发分散在 47 个小时、
+#   29 个币上，剔掉贡献最大的 10 次后等回撤年化/回撤比仍有 834，不挂止盈是 624）。
+#   高原内部各组档位的差异落在噪声范围，不值得精调，取 0.40/0.55/0.70。
+# - 空头：原来的 0.25/0.35/0.45 是净负贡献，已关闭（空列表 = 不挂空头止盈单）。空头所有
+#   <0.55 的档位边际贡献全为负，2025、2026 尤其明显——做空的币一小时内急跌 25%~45% 之后
+#   通常收盘跌得更多（趋势延续），提前止盈等于砍在半山腰。>=0.55 的档位虽然转正，但全样本
+#   只触发 10~14 次，属噪声级别，索性不挂。等回撤口径下：空头 25/35/45 → 917，关闭 → 985。
+LADDER_LEVELS_LONG = [0.40, 0.55, 0.70]   # 多头止盈档位（盈利比例）
+LADDER_LEVELS_SHORT = []                  # 空头止盈档位；空列表 = 关闭空头止盈（见上）
 
 CANCEL_LEAD_MINUTES = 1    # 主程序预计下单前多少分钟撤单清场
 WAIT_TIMEOUT_MINUTES = 20  # 等不到调仓完成信号，多久后兜底直接重建
@@ -84,7 +99,22 @@ TERMINAL_ORDER_STATUS = ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH') 
 # 把左尾损失截断在阈值附近。只做多头止损——对称的空头止损（暴涨止损）已经过代理估算验证是灾难性的，
 # 绝对不要加。2026-09-02 已用 calibrate_algo_order.py 在真实账户上校准过下单/查询/撤单三个接口
 # （见该脚本注释里链的 plan 文档），全部通过，正式开启。
-STOP_LOSS_ENABLED = True    # 总开关
+# 2026-09-07 按第七轮配置、并按实盘 3% 滑点重新评估后关闭
+# （research/analysis/research_丁针止损_第七轮.py，扫了 51 种条件 X × 17 种阈值 × 3 个方向 = 2584 组）：
+# - 最大回撤压不下来，且是结构性的：最大回撤那 16.6 天是 210 个小时各亏 1% 左右磨出来的，最差的
+#   一小时才 -5.29%；区间内 1140 个持仓小时里单小时逆向波动超过 30% 的一个都没有。2584 组里没有
+#   任何一组把最大回撤压低哪怕 0.5 个百分点，反而有 1502 组把回撤做得更大（低点砍掉、高位买回）。
+# - 逐笔看止损几乎总是卖在这根K线最差的位置：多头无条件止损 30% 阈值触发 50 次，止损成交收益均值
+#   -32.16%，而不止损持到收盘是 -26.13%，只有 15/50 次是止损更优。单K极端下插大多在收盘前收回一部分。
+# - 没有任何条件 X 能把"真崩"和"插针后收回"分开（试过单根涨/跌幅、累计涨跌幅、波动率、平均振幅、
+#   固定阈值与 N×ATR 自适应）。等回撤比值跑赢基准的 504 组，触发次数中位数是 0、最大 16 ——
+#   所有"跑赢"的配置赢的方式都是"几乎从不触发"，没有一组提升超过基准 5%。
+# - 原配置（SPIKE_THRESHOLD=0.25 + STOP_DROP=0.30）在 3% 滑点下等回撤年化/回撤比 606.46，
+#   基准（不止损）624.53，即 -2.9%；滑点 0%/3%/5% 分别是 626.88/606.46/584.86，只有零滑点才打平。
+# - 若将来仍想要一道"防某个币一小时内归零"的尾部保险，最便宜的点是【只做多头 + STOP_DROP=0.50】，
+#   全样本只触发 4~7 次、等回撤比值 625.42 ≈ 基准。绝不要收紧到 30% 以下，也绝不要给空头挂。
+# 下面 SPIKE_* / STOP_DROP 等参数保持原值不动，仅作为将来重新启用时的起点。
+STOP_LOSS_ENABLED = False   # 总开关
 SPIKE_WINDOW = 96           # is_spike 判定窗口（小时），窗口长度跟 Acc_reverse_v3 因子的 crash_window 出厂默认一致
 SPIKE_THRESHOLD = 0.25      # 窗口内只要有一根K线涨幅高于此阈值，即判定为 is_spike（本地概念，跟 Acc_reverse_v3 里基于跌幅的 is_crash 判定方向相反）
 STOP_DROP = 0.3             # 止损线：相对上一根已收盘K线收盘价的跌幅
@@ -283,6 +313,11 @@ def place_stop_order(acct_conf, symbol: str, side: str, stop_price: float) -> di
 # ====================================================================================================
 # ** 阶梯计算 **
 # ====================================================================================================
+def levels_for(position_amt: float) -> list:
+    """按净持仓方向取该方向配置的止盈档位。返回空列表代表这个方向的止盈已关闭。"""
+    return LADDER_LEVELS_LONG if position_amt > 0 else LADDER_LEVELS_SHORT
+
+
 def build_ladder_plan(hour_open_price: float, position_amt: float,
                        price_precision: int, qty_precision: int) -> list:
     """
@@ -290,11 +325,13 @@ def build_ladder_plan(hour_open_price: float, position_amt: float,
     跟持仓成本（均价）完全无关——每小时都是独立的一次新赌注。
     多头（position_amt > 0）：止盈价 = hour_open_price * (1 + level)，卖出平多
     空头（position_amt < 0）：止盈价 = hour_open_price * (1 - level)，买入平空
-    档位平分当前持仓量。
+    档位平分当前持仓量。该方向没配置档位（空列表）时返回空计划，不挂任何单。
     """
     is_long = position_amt > 0
     total_qty = abs(position_amt)
-    levels = LADDER_LEVELS_LONG if is_long else LADDER_LEVELS_SHORT
+    levels = levels_for(position_amt)
+    if not levels:  # 该方向止盈已关闭。这个护栏必须有，否则下面除以 len(levels) 会 ZeroDivisionError
+        return []
 
     qty_each = round_qty_down(total_qty / len(levels), qty_precision)
     if qty_each <= 0:
@@ -435,6 +472,12 @@ def rebuild_ladders(acct_conf, state: dict):
     for symbol, row in position_df.iterrows():
         try:
             position_amt = float(row['当前持仓量'])
+            if not levels_for(position_amt):
+                # 该方向的止盈已关闭。在拉行情之前就跳过，省掉一次没用的接口请求，
+                # 也避免走到下面 plan 为空的分支、打出误导性的"仓位过小"日志
+                logger.info(f'{symbol} {"多头" if position_amt > 0 else "空头"}止盈已关闭，本周期不挂止盈单')
+                continue
+
             price_precision = market_info['price_precision'].get(symbol, 4)
             qty_precision = market_info['min_qty'].get(symbol, 4)
             min_notional = market_info['min_notional'].get(symbol, 5)
@@ -647,8 +690,12 @@ def run_cycle(acct_conf, state: dict, run_time: datetime):
 
     # ---- 止损条件单：先撤旧的（此时新仓位已经确定），再按新持仓判定 is_spike 挂新的 ----
     # 顺序不可颠倒：先撤后挂，否则旧的 closePosition=true 条件单可能作用在调仓后的新仓位/新方向上。
+    # clear_stop_orders 不受 STOP_LOSS_ENABLED 控制：总开关关掉之后，之前挂出去的条件单也必须
+    # 有人撤，否则会变成永远留在账户上的孤儿单（closePosition=true 认 symbol 不认方向，该 symbol
+    # 反手做空时会在错误方向上触发平仓）。它内部本来就有"扫描账户全部条件单"的兜底，天然幂等，
+    # 没有止损单时只多一次查询请求。
+    clear_stop_orders(acct_conf, state)
     if STOP_LOSS_ENABLED:
-        clear_stop_orders(acct_conf, state)
         rebuild_stop_orders(acct_conf, state)
 
     if DRY_RUN:
