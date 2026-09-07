@@ -44,7 +44,8 @@ strategy_pool = [
         name='动量超混策略',
         strategy_list=[
     {
-        # 第六轮过滤配置 + 第三轮权重，见 research/optimization_round6/RESULTS.md（同步自 config.py，2026-09-07）
+        # 第七轮过滤配置 + 第三轮权重，见 research/optimization_round7/RESULTS.md
+        # （同步自根目录 config.py，2026-09-07；回测口径：最大回撤对齐 31.4564%，年化回撤比 624.63）
         "strategy": "Strategy_Acc多头_89",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -65,6 +66,9 @@ strategy_pool = [
             ('Cci', 24, 'val:>-36.829517', False),
             ('VolumeMeanRatio', 168, 'val:>1.0740995', False),
             ('Rsimean', 24, 'val:>0.38125909', False),
+            ('PctChange', 168, 'val:>0.087897425', False),
+            ('BounceFromLow', 22, 'val:>0.068314742', False),
+            ('涨跌幅max', 24, 'val:>0.04240766', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -87,8 +91,10 @@ strategy_pool = [
         "long_filter_list_post": [
             ('DrawdownFromHigh', 400, 'val:>-0.30', False),
             ('VolumeMeanRatio', 24, 'val:>0.45', False),
-            ('DrawdownFromHigh', 18, 'val:>-0.25', False),
-            ('DrawdownFromHigh', 168, 'val:>-0.29347055', False),
+            ('DrawdownFromHigh', 168, 'val:>-0.26511014', False),
+            ('Dbcd', 17, 'val:<3.9267862', False),
+            ('Acc_reverse', 89, 'val:>-0.00088426011', False),
+            ('ZfStd', 48, 'val:>0.017593278', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -131,10 +137,16 @@ strategy_pool = [
         ],
         "long_filter_list": [],
         "long_filter_list_post": [
-            ('DrawdownFromHigh', 6, 'val:>-0.30', False),
+            ('DrawdownFromHigh', 6, 'val:>-0.12460311', False),
             ('DrawdownFromHigh', 75, 'val:>-0.55', False),
             ('RealizedVol', 48, 'val:<0.025', False),
-            ('VolumeMeanRatio', 48, 'val:>0.6', False),
+            ('VolumeMeanRatio', 48, 'val:>0.49776389', False),
+            ('涨跌幅max', 6, 'val:>0.020889022', False),
+            ('RealizedVol', 168, 'val:>0.017184945', False),
+            ('MtmVolume', 6, 'val:<0.027182522', False),
+            ('RealizedVol', 60, 'val:<0.044555571', False),
+            ('VolumeMeanRatio', 12, 'val:>0.63202026', False),
+            ('跌幅max', 48, 'val:>0.028835826', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -155,9 +167,11 @@ strategy_pool = [
         ],
         "long_filter_list": [],
         "long_filter_list_post": [
-            ('VolumeMeanRatio', 24, 'val:>0.45', False),
-            ('BounceFromLow', 96, 'val:>0.051909127', False),
+            ('VolumeMeanRatio', 24, 'val:>0.63555158', False),
+            ('BounceFromLow', 96, 'val:>0.061111134', False),
             ('ZfStd', 48, 'val:>0.020861992', False),
+            ('跌幅max', 48, 'val:>0.02576173', False),
+            ('RealizedVol', 24, 'val:>0.007657194', False),
         ],
         "short_filter_list": [],
         "use_custom_func": False
@@ -188,7 +202,7 @@ strategy_pool = [
     ),
 ]
 
-leverage = 2  # 杠杆数。我看哪个赌狗要把这里改成大于1的。高杠杆如梦幻泡影。不要想着一夜暴富，脚踏实地赚自己该赚的钱。
+leverage = 3.4  # 杠杆数。我看哪个赌狗要把这里改成大于1的。高杠杆如梦幻泡影。不要想着一夜暴富，脚踏实地赚自己该赚的钱。
 black_list = ['BTC-USDT', 'ETH-USDT']  # 拉黑名单，永远不会交易。不喜欢的币、异常的币。例：LUNA-USDT, 这里与实盘不太一样，需要有'-'
 white_list = []  # 如果不为空，即只交易这些币，只在这些币当中进行选币。例：LUNA-USDT, 这里与实盘不太一样，需要有'-'
 # rebalance_mode =
