@@ -44,13 +44,13 @@ strategy_pool = [
         name='动量超混策略',
         strategy_list=[
     {
-        # 第七轮过滤配置 + 第三轮权重，见 research/optimization_round7/RESULTS.md
-        # （同步自根目录 config.py，2026-09-07；回测口径：最大回撤对齐 31.4564%，年化回撤比 624.63）
+        # 第九轮最终配置，见 research/optimization_round9/RESULTS.md
+        # （同步自根目录 config.py；执行门槛 min_order_usdt_ratio=0.0138）
         "strategy": "Strategy_Acc多头_89",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.15600000000000003,
+        'cap_weight': 0.17051392405063293,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -79,7 +79,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.23399999999999999,
+        'cap_weight': 0.25577088607594933,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -105,7 +105,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.21,
+        'cap_weight': 0.1365,
         'long_cap_weight': 0,
         'short_cap_weight': 1,
         'long_select_coin_num': 0,
@@ -127,7 +127,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.13,
+        'cap_weight': 0.14209493670886075,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -157,7 +157,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.13,
+        'cap_weight': 0.14209493670886075,
         'long_cap_weight': 1,
         'short_cap_weight': 0,
         'long_select_coin_num': 1,
@@ -182,7 +182,7 @@ strategy_pool = [
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
         "is_use_spot": False,
-        'cap_weight': 0.13999999999999999,
+        'cap_weight': 0.1530253164556962,
         'long_cap_weight': 0,
         'short_cap_weight': 1,
         'long_select_coin_num': 0,
@@ -205,5 +205,6 @@ strategy_pool = [
 leverage = 3.4  # 杠杆数。我看哪个赌狗要把这里改成大于1的。高杠杆如梦幻泡影。不要想着一夜暴富，脚踏实地赚自己该赚的钱。
 black_list = ['BTC-USDT', 'ETH-USDT']  # 拉黑名单，永远不会交易。不喜欢的币、异常的币。例：LUNA-USDT, 这里与实盘不太一样，需要有'-'
 white_list = []  # 如果不为空，即只交易这些币，只在这些币当中进行选币。例：LUNA-USDT, 这里与实盘不太一样，需要有'-'
-# rebalance_mode =
+rebalance_mode = {'mode': 'RebByEquityRatio',
+                  'params': {'min_order_usdt_ratio': 0.0138}}
 is_pure_long = False  # 纯多设置(https://bbs.quantclass.cn/thread/36230)
