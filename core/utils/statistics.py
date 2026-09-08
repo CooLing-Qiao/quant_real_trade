@@ -713,6 +713,9 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     equity_df['空头选币'] = equity_df['空头选币'].fillna(0)
     equity_df['多头单币最大持仓'] = equity_df['多头单币最大持仓'].fillna(0)
     equity_df['空头单币最大持仓'] = equity_df['空头单币最大持仓'].fillna(0)
+    # 净杠杆 = 净敞口 / 账户总净值 = 多头占比 - 空头占比（short_ratio 取的是绝对值，所以这里用减法）
+    # 跟 account_config.leverage 这个"设定杠杆"是两个概念：这里衡量多空对冲之后还剩多少方向性敞口
+    equity_df['net_leverage'] = equity_df['long_ratio'] - equity_df['short_ratio']
 
     time_diff = pd.to_timedelta(utc_offset + 1, unit='hours')
     if not is_send:
@@ -732,7 +735,7 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
         return equity_df
 
     # =画图
-    fig, (ax1, ax3, ax4, ax5, ax6, ax7) = plt.subplots(6, 1, figsize=(12, 16), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 3]})
+    fig, (ax1, ax3, ax_nl, ax4, ax5, ax6, ax7) = plt.subplots(7, 1, figsize=(12, 18), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 1, 3]})
     # 标记买入和卖出点
     buy_signals = equity_df[(equity_df['type'] == 'transfer') & (equity_df['账户总净值'] > 0)]
     # 移除 bf 利息加仓部分: 加仓金额 < 当前资金 * 10% / 365
@@ -821,6 +824,22 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     ax3.set_xlabel('Time')
     ax3.legend(loc='upper left')
     ax3.grid(True, linestyle='--', linewidth=0.5)
+
+    # 新增子图：净杠杆（净敞口/账户总净值），紧跟在多空占比（杠杆）子图后面
+    net_lev = equity_df['net_leverage'].to_numpy()
+    net_lev_time = equity_df['time'].to_numpy()
+    ax_nl.plot(net_lev_time, net_lev, color='#7b3fbf', linewidth=2, zorder=3,
+               label=f'净杠杆（当前 {equity_df["net_leverage"].iloc[-1]:.2f}）')
+    # 多头净敞口填绿、空头净敞口填红，方向一眼可见
+    ax_nl.fill_between(net_lev_time, net_lev, 0, where=(net_lev >= 0),
+                       color=long_color / 255, alpha=0.25, interpolate=True, zorder=2)
+    ax_nl.fill_between(net_lev_time, net_lev, 0, where=(net_lev < 0),
+                       color=short_color / 255, alpha=0.25, interpolate=True, zorder=2)
+    ax_nl.axhline(0, color='black', linewidth=0.8, alpha=0.6, zorder=1)
+    ax_nl.set_ylabel('净杠杆')
+    ax_nl.set_xlabel('Time')
+    ax_nl.legend(loc='upper left')
+    ax_nl.grid(True, linestyle='--', linewidth=0.5)
 
     # 新增子图：多头/空头选币数量（新的ax4）
     ax4.plot(equity_df['time'], equity_df['多头选币'],
