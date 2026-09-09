@@ -716,6 +716,8 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     # 净杠杆 = 净敞口 / 账户总净值 = 多头占比 - 空头占比（short_ratio 取的是绝对值，所以这里用减法）
     # 跟 account_config.leverage 这个"设定杠杆"是两个概念：这里衡量多空对冲之后还剩多少方向性敞口
     equity_df['net_leverage'] = equity_df['long_ratio'] - equity_df['short_ratio']
+    # 总杠杆 = 多空名义敞口之和 / 账户总净值，即 Ratio 图里 Long+Short 两层的高度（不含 empty），衡量实际动用了多少杠杆
+    equity_df['gross_leverage'] = equity_df['long_ratio'] + equity_df['short_ratio']
 
     time_diff = pd.to_timedelta(utc_offset + 1, unit='hours')
     if not is_send:
@@ -777,6 +779,14 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
             sub_stg_file = conf.get_result_folder() / '资金曲线.csv'
         sub_stg_equity = pd.read_csv(sub_stg_file, parse_dates=['candle_begin_time'], index_col=0)
         sub_stg_equity['candle_begin_time'] = sub_stg_equity['candle_begin_time'].dt.tz_localize(None)
+        # 当前回撤必须在按图窗口裁剪之前算：用完整回测曲线（get_kline_num 根K线，约68天）的 expanding 前高，
+        # 否则 7 天图会把真正的前高截在窗口外，算出一个偏小的假回撤
+        if sub_stg_equity.empty:
+            continue
+        sub_stg_dd = (sub_stg_equity['equity'].iloc[-1] / sub_stg_equity['equity'].cummax().iloc[-1] - 1) * 100
+        # 回测曲线实际跨度：由 get_kline_num 减去因子预热得到，各账户/各轮会浮动，所以按实际长度动态算，不写死
+        sub_stg_days = (sub_stg_equity['candle_begin_time'].iloc[-1] -
+                        sub_stg_equity['candle_begin_time'].iloc[0]).total_seconds() / 86400
         sub_stg_equity = sub_stg_equity[sub_stg_equity['candle_begin_time'] >= equity_df['time'].min() - time_diff].reset_index(drop=True)
         if sub_stg_equity.empty:
             continue
@@ -787,7 +797,8 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
             pd.to_datetime(sub_stg_equity['candle_begin_time']) + time_diff,
             sub_stg_equity['净值'],
             color=get_color(idx),
-            label=conf.name if position_df.empty else f'{conf.name}-{round(position_df.iloc[-1][idx] * 100, 4)}%',
+            label=(conf.name if position_df.empty else f'{conf.name}-{round(position_df.iloc[-1][idx] * 100, 4)}%')
+                  + f' {sub_stg_days:.0f}d dd:{sub_stg_dd:.2f}%',
             zorder=3,
             alpha=0.5
         )[0]
@@ -822,7 +833,12 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
                   colors=[long_color / 255, short_color / 255, empty_color / 255], alpha=0.9)
     ax3.set_ylabel('Ratio')
     ax3.set_xlabel('Time')
-    ax3.legend(loc='upper left')
+    # 图例里补一条当前总杠杆（多+空），只显示文字不画线
+    gross_lev_proxy = mtlines.Line2D([], [], linestyle='none',
+                                     label=f'总杠杆（当前 {equity_df["gross_leverage"].iloc[-1]:.2f}）')
+    stack_handles, stack_labels = ax3.get_legend_handles_labels()
+    ax3.legend(handles=stack_handles + [gross_lev_proxy],
+               labels=stack_labels + [gross_lev_proxy.get_label()], loc='upper left')
     ax3.grid(True, linestyle='--', linewidth=0.5)
 
     # 新增子图：净杠杆（净敞口/账户总净值），紧跟在多空占比（杠杆）子图后面
