@@ -7,9 +7,23 @@ eps = 1e-8
 
 def signal(*args):
     df = args[0]
-    n = args[1]
+    param = args[1]
     factor_name = args[2]
     crash_window = 96  # 暴跌检测与最低点定位统一使用同一个窗口
+
+    # param 支持两种写法：单个 n（上下轨都用 Bollinger 标准的 2 倍标准差），
+    # 或 (n, upper_mult, lower_mult) 元组，把上下轨拆开单独配置。
+    #
+    # 拆开的依据：deviate 的两个分支完全独立——`low > upper` 只产生正 deviate（多头信号），
+    # `high < lower` 只产生负 deviate（空头信号），实测只动一侧时另一侧的突破根数 +0.00%。
+    # 对多头而言两侧作用方向相反：上轨降低=正信号变多，下轨降低=负拖累变多，
+    # 原来用同一个倍数锁死两侧只能取折中，这也是过去单调 mult 怎么调都变差的原因。
+    # 上轨一律保持 2（Bollinger 的标准定义，不参与寻优）；只把下轨外推。
+    # 详见 research/optimization_round14/RESULTS.md、round15、round16。
+    if isinstance(param, (tuple, list)):
+        n, upper_mult, lower_mult = param
+    else:
+        n, upper_mult, lower_mult = param, 2, 2
 
     close = df['close'].to_numpy()
     p_change = df['close'].pct_change().fillna(0)
@@ -34,8 +48,8 @@ def signal(*args):
 
     mean = df['close'].rolling(n).mean()
     std = df['close'].rolling(n).std(ddof=0)
-    upper = mean + 2 * std
-    lower = mean - 2 * std
+    upper = mean + upper_mult * std     # 只影响向上突破（多头信号）
+    lower = mean - lower_mult * std     # 只影响向下突破（多头的负拖累）
 
     deviate = np.select(
         [df['low'] > upper, df['high'] < lower],

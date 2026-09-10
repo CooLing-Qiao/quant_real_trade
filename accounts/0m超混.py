@@ -56,7 +56,10 @@ strategy_pool = [
         'long_select_coin_num': 1,
         'short_select_coin_num': 0,
         "factor_list": [
-            ('Acc_reverse', False, 89, 1),
+            # (89, 上轨2.0, 下轨2.3)：上轨保持 Bollinger 标准的 2 倍不动，只把下轨外推。
+            # 下轨只影响向下突破产生的负 deviate，对多头是纯拖累。
+            # 与回测 config.py 同步，详见 research/optimization_round16/RESULTS.md
+            ('Acc_reverse', False, (89, 2.0, 2.3), 1),
         ],
         "long_filter_list": [],
         "long_filter_list_post": [
@@ -85,7 +88,8 @@ strategy_pool = [
         'long_select_coin_num': 1,
         'short_select_coin_num': 0,
         "factor_list": [
-            ('Acc_reverse', False, 550, 1),
+            # (550, 上轨2.0, 下轨3.0)：同上。与回测 config.py 同步。
+            ('Acc_reverse', False, (550, 2.0, 3.0), 1),
         ],
         "long_filter_list": [],
         "long_filter_list_post": [

@@ -51,8 +51,13 @@ def signal(*args):
 
     mean = df['close'].rolling(n).mean()
     std = df['close'].rolling(n).std(ddof=0)
-    upper = mean + 2 * std
-    lower = mean - 2 * std
+    # 布林倍数 2.05：第十一/十三轮遍历得出（1.5~3.0 粗网格 + 2.00~2.40 细网格）。
+    # 等回撤口径 1173.9895 → 1260.4655（+7.37%），七档杠杆全正，基线杠杆下最大回撤
+    # 反而更低（0.3144 < 0.3146，收益风险同步改善），分年三正一负、最差年 -1.49%。
+    # 邻域 2.05~2.25 是连续正向平台，不是孤立尖峰；2.35 以上转负。
+    # 详见 research/optimization_round11/RESULTS.md
+    upper = mean + 2.05 * std
+    lower = mean - 2.05 * std
 
     deviate = np.select(
         [df['low'] > upper, df['high'] < lower],
