@@ -19,8 +19,11 @@ account_config = {
     # ++++ 企业微信机器人功能 ++++
     "wechat_webhook_url": 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=80a8b84c-1051-4b19-a864-b57030eda378',
     # ++++ 下单量配置 ++++
-    "max_one_order_amount": 300,  # 单次最大下单金额：300 USDT（超过此金额会自动拆单）
-    "twap_interval": 1,            # 拆单间隔：3秒
+    # 单次最大下单金额（超过会自动拆单，实际值随机 ±20%）。2026-09-11 由 300 提到 1500：
+    # 300 时一个 ~16k 的仓要拆 50 多单、下单 60~70 秒，推送图"执行成本"显示正常换仓每 100% 换手要付 0.3~0.5%，
+    # 主要就是这 1 分多钟的延迟；提到 1500 后拆成十几单、十几秒下完。若观察到单笔滑点明显变大再往回调
+    "max_one_order_amount": 1500,
+    "twap_interval": 1,            # 拆单间隔：1秒
     "order_swap_money_limit": 10,  # 合约最小下单金额：10 USDT
 }
 
