@@ -22,7 +22,7 @@ from core.model.account_config import AccountConfig
 from core.model.backtest_config import MultiEquityBacktestConfig, BacktestConfig
 from core.position import calc_target_position
 from core.utils.functions import refresh_diff_time, save_symbol_order, save_final_select_results, save_position_results, \
-    save_performance_df_csv, save_run_timing
+    save_performance_df_csv, save_run_timing, save_pre_rebalance_equity
 from core.utils.datatools import get_bmac_ready_time
 from core.utils.log_kit import logger, divider
 from core.utils.path_kit import get_folder_path
@@ -70,6 +70,15 @@ def run_by_account(acct_conf: AccountConfig, me_conf: MultiEquityBacktestConfig,
 
     # =====保存持仓快照（在下单前执行，确保能捕获到所有持仓币种）
     save_position_snapshot(acct_conf, run_time)
+
+    # =====记录下单前的账户总净值（account_exec.py 里 update_account_info 刚拿到的，run_time 整点、还没撤单/下单）
+    # 供 statistics.py 计算推送图里的"执行成本"（跟回测上一根K线的收盘净值对齐）。调试模式没更新账户信息，跳过
+    pre_equity = getattr(acct_conf, 'account_equity', None)
+    if pre_equity:
+        try:
+            save_pre_rebalance_equity(run_time, acct_conf.name, pre_equity)
+        except Exception as e:
+            logger.warning(f'[{acct_conf.name}] 记录下单前净值失败，不影响下单：{e}')
 
     # 撤销所有币种挂单
     if is_debug:

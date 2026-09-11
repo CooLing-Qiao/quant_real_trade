@@ -683,6 +683,217 @@ def get_color(index):
         return rgb
 
 
+def _load_sub_stg_equity(conf, time_diff):
+    """
+    读取某个子策略本轮跑出来的回测资金曲线（有再择时优先用再择时那条），candle_begin_time 转成本地"收盘时刻"
+    （+utc_offset+1h），这样 candle(H-1) 这一行的时间戳就是 run_time=H，跟实盘净值的时间对齐
+    """
+    sub_stg_file = conf.get_result_folder() / '资金曲线_再择时.csv'
+    if not sub_stg_file.exists():
+        sub_stg_file = conf.get_result_folder() / '资金曲线.csv'
+    if not sub_stg_file.exists():
+        return pd.DataFrame()
+    sub_stg_equity = pd.read_csv(sub_stg_file, parse_dates=['candle_begin_time'], index_col=0)
+    sub_stg_equity['close_time'] = sub_stg_equity['candle_begin_time'].dt.tz_localize(None) + time_diff
+    return sub_stg_equity
+
+
+def save_execution_cost(account_config: AccountConfig, me_conf, run_time, transfer_df):
+    """
+    每小时追加一行"执行成本"记录到 data/<账户名>/执行成本记录.csv，供推送图画"执行成本 / 累积执行成本 / 资金费"子图。
+
+    执行成本 = 实盘小时收益(剔除资金费、剔除划转) - 回测小时收益，负数代表实盘跑输回测。
+    - 实盘小时收益：用 run_by_account 下单前记录的账户总净值（下单前净值记录.csv），
+      本小时(run_time) 相对上一小时(run_time - 1H)。这个时点跟回测 candle(run_time - 1H) 的收盘对齐——
+      两边都是"上一轮换仓成交 + 持有一根K线"，回测下一根K线开盘才成交。
+    - 回测小时收益：本轮 run_by_account 刚跑出来的子策略资金曲线的最后一行（candle = run_time - 1H）。
+      每小时用当时线上的配置记一行，之后改策略配置不会污染历史记录（所以不做历史回填）。
+      多个子策略时按 仓位比例.csv 加权求和（近似，单策略池时权重就是 1）。
+    - 资金费：交易所 income 流水里 FUNDING_FEE 在 (上小时记录时刻, 本小时记录时刻] 内的合计，正数 = 收到资金费。
+      回测里 funding_fee 恒为 0（BMAC 没喂资金费率），所以实盘收益要先剔掉资金费再跟回测比。
+      只有统一账户客户端实现了 get_swap_income_df，普通账户记 NaN、按 0 处理。
+    同一个 run_time 重复运行时以最后一次为准。
+    """
+    cost_path = get_file_path(data_path, account_config.name, '执行成本记录.csv', as_path_type=True)
+    pre_equity_path = get_file_path(data_path, account_config.name, '下单前净值记录.csv', as_path_type=True)
+    if not pre_equity_path.exists():
+        print('没有下单前净值记录，跳过执行成本统计')
+        return
+    pre_equity_df = pd.read_csv(pre_equity_path, encoding='utf-8-sig', parse_dates=['run_time', '记录时间'])
+    pre_equity_df = pre_equity_df.drop_duplicates(subset=['run_time'], keep='last').set_index('run_time')
+    prev_time = run_time - pd.Timedelta(hours=1)
+    if run_time not in pre_equity_df.index or prev_time not in pre_equity_df.index:
+        # 本小时或上小时没跑（重启、报错），这一小时的实盘收益跨了不止一根K线，没法跟回测一一对应，记 NaN
+        print(f'下单前净值记录缺少 {prev_time} 或 {run_time}，本小时执行成本记 NaN')
+        equity_prev = equity_now = np.nan
+        ts_prev = ts_now = pd.NaT
+    else:
+        equity_prev = pre_equity_df.loc[prev_time, '账户总净值']
+        equity_now = pre_equity_df.loc[run_time, '账户总净值']
+        ts_prev = pre_equity_df.loc[prev_time, '记录时间']
+        ts_now = pre_equity_df.loc[run_time, '记录时间']
+
+    # =划转：窗口内的转入/转出要从本小时净值里扣掉，否则一笔入金会被当成一根 30% 的大阳线
+    transfer_amount = 0.0
+    if transfer_df is not None and not transfer_df.empty and pd.notna(ts_prev):
+        _transfer = transfer_df[(transfer_df['time'] > ts_prev) & (transfer_df['time'] <= ts_now)]
+        transfer_amount = float(_transfer['账户总净值'].sum())
+
+    # =资金费：只有统一账户有 income 接口
+    funding_fee = np.nan
+    if pd.notna(ts_prev) and hasattr(account_config.bn, 'get_swap_income_df'):
+        try:
+            # 接口内部用 date_time.timestamp() 换算 startTime：naive 的 pd.Timestamp 会被当成 UTC，
+            # 而 python datetime 才按系统时区算，跟 fetch_transfer_history 传 datetime.now() 的约定一致
+            income_df = account_config.bn.get_swap_income_df((ts_prev - pd.Timedelta(minutes=5)).to_pydatetime())
+            if income_df is None or income_df.empty:
+                funding_fee = 0.0
+            else:
+                # income 里的 time 是 UTC，转成本地时间再按窗口裁切
+                income_df['time'] = income_df['time'] + pd.Timedelta(hours=utc_offset)
+                _funding = income_df[(income_df['incomeType'] == 'FUNDING_FEE') &
+                                     (income_df['time'] > ts_prev) & (income_df['time'] <= ts_now)]
+                funding_fee = float(_funding['income'].sum())
+        except Exception as e:
+            print(f'获取资金费流水失败，本小时资金费记 NaN：{e}')
+
+    # =回测小时收益：取本轮刚跑出来的资金曲线最后一行，必须正好是 candle(run_time - 1H)，否则说明回测结果是旧的
+    time_diff = pd.to_timedelta(utc_offset + 1, unit='hours')
+    bt_ret = 0.0
+    bt_fee_ret = 0.0
+    bt_valid = False
+    position_df = me_conf.factory.result_folder / '仓位比例.csv'
+    position_df = pd.read_csv(position_df, index_col=0) if position_df.exists() else pd.DataFrame()
+    for idx, conf in enumerate(me_conf.factory.config_list):
+        sub_stg_equity = _load_sub_stg_equity(conf, time_diff)
+        if len(sub_stg_equity) < 2:
+            continue
+        last = sub_stg_equity.iloc[-1]
+        if abs((last['close_time'] - run_time).total_seconds()) > 3600:
+            print(f'子策略 {conf.name} 资金曲线最后一根K线 {last["close_time"]} 跟 run_time {run_time} 对不上，跳过')
+            continue
+        prev_equity = sub_stg_equity.iloc[-2]['equity']
+        if len(me_conf.factory.config_list) == 1:
+            weight = 1.0
+        else:
+            # 仓位比例.csv 的 index 是 UTC 的 candle_begin_time；这一根K线里持有的仓位是上一根K线决定的，取上一行
+            pos_times = pd.to_datetime(position_df.index).tz_localize(None) + time_diff
+            _pos = position_df[pos_times <= prev_time]
+            weight = float(_pos.iloc[-1][str(idx)]) if not _pos.empty else 0.0
+        bt_ret += weight * (last['equity'] / prev_equity - 1)
+        bt_fee_ret += weight * (last['fee'] / prev_equity)
+        bt_valid = True
+    if not bt_valid:
+        bt_ret = bt_fee_ret = np.nan
+
+    # =汇总
+    live_ret = equity_now / equity_prev - 1 if equity_prev else np.nan
+    _funding_for_calc = 0.0 if pd.isna(funding_fee) else funding_fee
+    live_ret_ex_funding = (equity_now - transfer_amount - _funding_for_calc) / equity_prev - 1 if equity_prev else np.nan
+    funding_ret = funding_fee / equity_prev if equity_prev else np.nan
+    new_row = pd.DataFrame([{
+        'run_time': run_time,
+        '下单前净值_上小时': equity_prev,
+        '下单前净值_本小时': equity_now,
+        '划转金额': transfer_amount,
+        '资金费': funding_fee,
+        '实盘收益': live_ret,
+        '实盘收益_剔除资金费': live_ret_ex_funding,
+        '回测收益': bt_ret,
+        '回测手续费率': bt_fee_ret,
+        '执行成本': live_ret_ex_funding - bt_ret,
+        '资金费率': funding_ret,
+    }])
+    if cost_path.exists():
+        cost_df = pd.read_csv(cost_path, encoding='utf-8-sig', parse_dates=['run_time'])
+        cost_df = pd.concat([cost_df, new_row], ignore_index=True)
+        cost_df.drop_duplicates(subset=['run_time'], keep='last', inplace=True)
+        cost_df.sort_values('run_time', inplace=True)
+    else:
+        cost_df = new_row
+    cost_df = cost_df.tail(24 * 45)
+    cost_df.to_csv(cost_path, encoding='utf-8-sig', index=False)
+    print(f'执行成本记录：实盘 {live_ret_ex_funding:+.4%}（剔资金费） 回测 {bt_ret:+.4%} '
+          f'执行成本 {live_ret_ex_funding - bt_ret:+.4%} 资金费 {funding_fee}')
+
+
+def _draw_bars_by_sign(ax, times, values, pos_color, neg_color, label):
+    """按正负着色的小时柱状图（时间轴单位是天，一小时约 0.9/24 宽）"""
+    values = np.asarray(values, dtype=float)
+    colors = np.where(values >= 0, pos_color, neg_color)
+    ax.bar(times, values, width=0.9 / 24, color=colors, alpha=0.8, zorder=2, label=label)
+    ax.axhline(0, color='black', linewidth=0.8, alpha=0.6, zorder=1)
+
+
+def draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config: AccountConfig, equity_df):
+    """
+    画 4 个子图：每小时执行成本、累积执行成本、每小时资金费、累积资金费。
+    数据来自 save_execution_cost 写的 执行成本记录.csv，按推送图窗口（equity_df 的时间范围）裁切。
+    累积用复利：累积执行成本 = ∏(1+实盘收益_剔除资金费) / ∏(1+回测收益) - 1，累积资金费 = ∏(1+资金费率) - 1，
+    缺失的小时（NaN）按 0 处理，不参与复利。
+    """
+    t_min, t_max = equity_df['time'].min(), equity_df['time'].max()
+    window_days = max((t_max - t_min).total_seconds() / 86400, 1)
+    cost_path = get_file_path(data_path, account_config.name, '执行成本记录.csv', as_path_type=True)
+    cost_df = pd.DataFrame()
+    if cost_path.exists():
+        cost_df = pd.read_csv(cost_path, encoding='utf-8-sig', parse_dates=['run_time'])
+        cost_df = cost_df[(cost_df['run_time'] >= t_min) & (cost_df['run_time'] <= t_max)].reset_index(drop=True)
+
+    for ax, ylabel in [(ax_ec, '执行成本(%)'), (ax_ecc, '累积执行成本(%)'), (ax_ff, '资金费(%)'), (ax_ffc, '累积资金费(%)')]:
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel('Time')
+        ax.grid(True, linestyle='--', linewidth=0.5)
+        ax.yaxis.set_major_formatter(yticks)
+    if cost_df.empty:
+        for ax in (ax_ec, ax_ecc, ax_ff, ax_ffc):
+            ax.text(0.5, 0.5, '暂无执行成本记录', ha='center', va='center', transform=ax.transAxes)
+        return
+
+    times = cost_df['run_time'].to_numpy()
+    latest = cost_df.iloc[-1]
+    green, red = '#1eb100', '#ff634d'
+
+    # 子图：每小时执行成本（实盘剔资金费 - 回测），负数 = 实盘跑输
+    _draw_bars_by_sign(ax_ec, times, cost_df['执行成本'].fillna(0) * 100, green, red,
+                       label=f'执行成本 = 实盘(剔资金费) - 回测（本次 {latest["执行成本"] * 100:+.3f}%）')
+    bt_fee_proxy = mtlines.Line2D([], [], linestyle='none',
+                                  label=f'回测手续费（本次 {latest["回测手续费率"] * 100:.4f}%）')
+    ec_handles, ec_labels = ax_ec.get_legend_handles_labels()
+    ax_ec.legend(handles=ec_handles + [bt_fee_proxy], labels=ec_labels + [bt_fee_proxy.get_label()], loc='upper left')
+
+    # 子图：累积执行成本（复利）
+    cum_live = (1 + cost_df['实盘收益_剔除资金费'].fillna(0)).cumprod()
+    cum_bt = (1 + cost_df['回测收益'].fillna(0)).cumprod()
+    cum_cost = (cum_live / cum_bt - 1) * 100
+    ax_ecc.plot(times, cum_cost.to_numpy(), color='#7b3fbf', linewidth=2, zorder=3,
+                label=f'累积执行成本（近{window_days:.0f}天 {cum_cost.iloc[-1]:+.2f}%）')
+    ax_ecc.fill_between(times, cum_cost.to_numpy(), 0, where=(cum_cost >= 0), color=green, alpha=0.2, interpolate=True)
+    ax_ecc.fill_between(times, cum_cost.to_numpy(), 0, where=(cum_cost < 0), color=red, alpha=0.2, interpolate=True)
+    ax_ecc.axhline(0, color='black', linewidth=0.8, alpha=0.6, zorder=1)
+    ax_ecc.legend(loc='upper left')
+
+    # 子图：每小时资金费（正 = 收到）
+    funding_latest = latest['资金费率'] * 100
+    _draw_bars_by_sign(ax_ff, times, cost_df['资金费率'].fillna(0) * 100, green, red,
+                       label=f'资金费收益（本次 {funding_latest:+.4f}%，{latest["资金费"]:+.2f} U）'
+                       if pd.notna(funding_latest) else '资金费收益（本次 无数据）')
+    ax_ff.legend(loc='upper left')
+
+    # 子图：累积资金费（复利）
+    cum_funding = ((1 + cost_df['资金费率'].fillna(0)).cumprod() - 1) * 100
+    ax_ffc.plot(times, cum_funding.to_numpy(), color='#1f77b4', linewidth=2, zorder=3,
+                label=f'累积资金费收益（近{window_days:.0f}天 {cum_funding.iloc[-1]:+.3f}%，'
+                      f'{cost_df["资金费"].sum():+.2f} U）')
+    ax_ffc.fill_between(times, cum_funding.to_numpy(), 0, where=(cum_funding >= 0), color=green, alpha=0.2, interpolate=True)
+    ax_ffc.fill_between(times, cum_funding.to_numpy(), 0, where=(cum_funding < 0), color=red, alpha=0.2, interpolate=True)
+    ax_ffc.axhline(0, color='black', linewidth=0.8, alpha=0.6, zorder=1)
+    ax_ffc.legend(loc='upper left')
+
+    for ax in (ax_ec, ax_ecc, ax_ff, ax_ffc):
+        ax.set_xlim(t_min, t_max)
+
+
 def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_config: AccountConfig, is_send=True):
     """
     画资金曲线并发送图片
@@ -737,7 +948,8 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
         return equity_df
 
     # =画图
-    fig, (ax1, ax3, ax_nl, ax4, ax5, ax6, ax_rt, ax7) = plt.subplots(8, 1, figsize=(12, 20), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 1, 1, 3]})
+    fig, (ax1, ax3, ax_nl, ax4, ax5, ax6, ax_rt, ax_ec, ax_ecc, ax_ff, ax_ffc, ax7) = plt.subplots(
+        12, 1, figsize=(12, 28), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3]})
     # 标记买入和卖出点
     buy_signals = equity_df[(equity_df['type'] == 'transfer') & (equity_df['账户总净值'] > 0)]
     # 移除 bf 利息加仓部分: 加仓金额 < 当前资金 * 10% / 365
@@ -913,6 +1125,9 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     ax_rt.grid(True, linestyle='--', linewidth=0.5)
     ax_rt.set_xlabel('Time')
 
+    # 新增子图：执行成本（实盘 vs 回测）、累积执行成本、资金费、累积资金费
+    draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config, equity_df)
+
     # 增加资金曲线副图
     ax7.scatter(buy_signals['time'], buy_signals['net'], marker='+', color='black', label='add', s=100)
     ax7.scatter(sell_signals['time'], sell_signals['net'], marker='x', color='red', label='reduce', s=100)
@@ -949,7 +1164,7 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
 
 
 def save_and_send_equity_info(account_config: AccountConfig, me_conf, spot_position, swap_position, spot_equity, account_equity, spot_usdt,
-                              seed_coin_spot_equity):
+                              seed_coin_spot_equity, run_time=None):
     """
     保存、发送账户信息
     :param account_config: 账户配置对象
@@ -960,6 +1175,7 @@ def save_and_send_equity_info(account_config: AccountConfig, me_conf, spot_posit
     :param account_equity: 账户净值
     :param spot_usdt: 现货的u
     :param seed_coin_spot_equity: 种子现货价值
+    :param run_time: 本轮调仓时间，用于记录执行成本（None 则跳过）
     :return:
     """
     # =创建需要存储equity的df
@@ -1021,6 +1237,13 @@ def save_and_send_equity_info(account_config: AccountConfig, me_conf, spot_posit
         transfer_df = account_config.bn.fetch_transfer_history()
         transfer_path = get_file_path(data_path, account_config.name, '账户信息', 'transfer.csv')
         transfer_df = get_and_save_local_transfer(transfer_df, transfer_path)
+        # =记录本小时的执行成本（实盘 vs 回测、资金费），要在画图之前写入，图里才有"本次"
+        if run_time is not None:
+            try:
+                save_execution_cost(account_config, me_conf, run_time, transfer_df)
+            except Exception as e:
+                print(f'记录执行成本失败，不影响推送：{e}')
+                print(traceback.format_exc())
         # =构建上线后所有数据
         equity_df0 = equity_df_temp.copy()
         full_hist_df = draw_equity_and_send_pic(me_conf, equity_df0, transfer_df, 'equity-curve(All days)', account_config, is_send=False)
@@ -1363,7 +1586,7 @@ def run():
         send_pos_strategy_info(me_conf, account_info)
 
         # ===生成账户净值信息
-        equity_msg = save_and_send_equity_info(account_info, me_conf, spot_position, swap_position, spot_equity, account_equity, spot_usdt, seed_coin_spot_equity)
+        equity_msg = save_and_send_equity_info(account_info, me_conf, spot_position, swap_position, spot_equity, account_equity, spot_usdt, seed_coin_spot_equity, run_time=run_time)
         # =发送账户净值信息
         send_wechat_work_msg(equity_msg, account_info.wechat_webhook_url)
 

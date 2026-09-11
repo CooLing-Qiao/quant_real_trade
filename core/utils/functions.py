@@ -14,6 +14,7 @@ import os
 import time
 import traceback
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
@@ -243,6 +244,34 @@ def save_run_timing(run_time, account_name, data_ready_time, calc_done_time, ord
     # 最多保留 30 天（按小时记录），避免文件无限增长
     timing_df = timing_df.tail(24 * 30)
     timing_df.to_csv(file_path, encoding='utf-8-sig', index=False)
+
+
+def save_pre_rebalance_equity(run_time, account_name, account_equity):
+    """
+    记录每一轮调仓**之前**（run_time 整点刚过、撤单/下单都还没发生）的账户总净值。
+    追加写入 data/<账户名>/下单前净值记录.csv，供 statistics.py 计算"执行成本"：
+    这个时点的净值才跟回测里 candle(run_time - 1H) 的收盘净值对齐（回测在下一根K线开盘才成交），
+    statistics.py 里下单后 1~2 分钟采的 equity.csv 快照会多混进 2~3 分钟的行情波动。
+    同一个 run_time 重复运行时以最后一次为准。
+    """
+    file_path = Path(data_path) / account_name / '下单前净值记录.csv'
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    new_row = pd.DataFrame([{
+        'run_time': run_time,
+        '记录时间': datetime.now(),
+        '账户总净值': account_equity,
+    }])
+    if file_path.exists():
+        equity_df = pd.read_csv(file_path, encoding='utf-8-sig', parse_dates=['run_time', '记录时间'])
+        equity_df = pd.concat([equity_df, new_row], ignore_index=True)
+        equity_df.drop_duplicates(subset=['run_time'], keep='last', inplace=True)
+        equity_df.sort_values('run_time', inplace=True)
+    else:
+        equity_df = new_row
+    # 推送图最长看 30 天，多留一点余量
+    equity_df = equity_df.tail(24 * 45)
+    equity_df.to_csv(file_path, encoding='utf-8-sig', index=False)
 
 
 def ignore_error(anything):

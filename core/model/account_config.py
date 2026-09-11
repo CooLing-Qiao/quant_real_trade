@@ -304,6 +304,9 @@ class AccountConfig:
         self.spot_position = spot_position
         self.spot_equity = spot_equity - self.buy_bnb_value * 2
         self.spot_usdt = spot_usdt
+        # 账户总净值（含未实现盈亏），口径同 statistics.py 里 equity.csv 的"账户总净值"；
+        # 在 run_by_account 里下单前落盘，供推送图"执行成本"跟回测对比
+        self.account_equity = account_overview.get('account_equity', None)
 
         self.is_usable = True
         return dict(
