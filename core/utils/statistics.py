@@ -702,8 +702,9 @@ def save_execution_cost(account_config: AccountConfig, me_conf, run_time, transf
     """
     每小时追加一行"执行成本"记录到 data/<账户名>/执行成本记录.csv，供推送图画"执行成本 / 累积执行成本 / 资金费"子图。
 
-    执行成本 = (1 + 实盘小时收益(剔除资金费、剔除划转)) / (1 + 回测小时收益) - 1，即实盘相对回测的超额收益，
-    负数代表实盘跑输回测。用除不用减，是为了跟累积口径一致：累积执行成本 = ∏(1 + 每小时执行成本) - 1。
+    执行成本 = (1 + 回测小时收益) / (1 + 实盘小时收益(剔除资金费、剔除划转)) - 1，
+    即"实盘比回测少赚了多少"：**正数 = 实盘跑输回测（真的付出了成本），负数 = 实盘反而跑赢**。
+    用除不用减，是为了跟累积口径一致：累积执行成本 = ∏(1 + 每小时执行成本) - 1。
     - 实盘小时收益：用 run_by_account 下单前记录的账户总净值（下单前净值记录.csv），
       本小时(run_time) 相对上一小时(run_time - 1H)。这个时点跟回测 candle(run_time - 1H) 的收盘对齐——
       两边都是"上一轮换仓成交 + 持有一根K线"，回测下一根K线开盘才成交。
@@ -802,7 +803,7 @@ def save_execution_cost(account_config: AccountConfig, me_conf, run_time, transf
         '实盘收益_剔除资金费': live_ret_ex_funding,
         '回测收益': bt_ret,
         '回测手续费率': bt_fee_ret,
-        '执行成本': (1 + live_ret_ex_funding) / (1 + bt_ret) - 1,
+        '执行成本': (1 + bt_ret) / (1 + live_ret_ex_funding) - 1,
         '资金费率': funding_ret,
     }])
     if cost_path.exists():
@@ -815,7 +816,7 @@ def save_execution_cost(account_config: AccountConfig, me_conf, run_time, transf
     cost_df = cost_df.tail(24 * 45)
     cost_df.to_csv(cost_path, encoding='utf-8-sig', index=False)
     print(f'执行成本记录：实盘 {live_ret_ex_funding:+.4%}（剔资金费） 回测 {bt_ret:+.4%} '
-          f'执行成本 {(1 + live_ret_ex_funding) / (1 + bt_ret) - 1:+.4%} 资金费 {funding_fee}')
+          f'执行成本 {(1 + bt_ret) / (1 + live_ret_ex_funding) - 1:+.4%}（正=实盘跑输） 资金费 {funding_fee}')
 
 
 def _draw_bars_by_sign(ax, times, values, pos_color, neg_color, label):
@@ -830,7 +831,7 @@ def draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config: AccountCon
     """
     画 4 个子图：每小时执行成本、累积执行成本、每小时资金费、累积资金费。
     数据来自 save_execution_cost 写的 执行成本记录.csv，按推送图窗口（equity_df 的时间范围）裁切。
-    累积用复利：累积执行成本 = ∏(1+实盘收益_剔除资金费) / ∏(1+回测收益) - 1，累积资金费 = ∏(1+资金费率) - 1，
+    累积用复利：累积执行成本 = ∏(1+每小时执行成本) - 1（正=实盘累计跑输回测），累积资金费 = ∏(1+资金费率) - 1，
     缺失的小时（NaN）按 0 处理，不参与复利。
     """
     t_min, t_max = equity_df['time'].min(), equity_df['time'].max()
@@ -841,7 +842,8 @@ def draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config: AccountCon
         cost_df = pd.read_csv(cost_path, encoding='utf-8-sig', parse_dates=['run_time'])
         cost_df = cost_df[(cost_df['run_time'] >= t_min) & (cost_df['run_time'] <= t_max)].reset_index(drop=True)
 
-    for ax, ylabel in [(ax_ec, '执行成本(%)'), (ax_ecc, '累积执行成本(%)'), (ax_ff, '资金费(%)'), (ax_ffc, '累积资金费(%)')]:
+    for ax, ylabel in [(ax_ec, '执行成本(%) 正=实盘跑输'), (ax_ecc, '累积执行成本(%) 正=实盘跑输'),
+                       (ax_ff, '资金费(%) 正=收到'), (ax_ffc, '累积资金费(%) 正=收到')]:
         ax.set_ylabel(ylabel)
         ax.set_xlabel('Time')
         ax.grid(True, linestyle='--', linewidth=0.5)
@@ -855,9 +857,10 @@ def draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config: AccountCon
     latest = cost_df.iloc[-1]
     green, red = '#1eb100', '#ff634d'
 
-    # 子图：每小时执行成本（实盘剔资金费 - 回测），负数 = 实盘跑输
-    _draw_bars_by_sign(ax_ec, times, cost_df['执行成本'].fillna(0) * 100, green, red,
-                       label=f'执行成本 = (1+实盘剔资金费)/(1+回测) - 1（本次 {latest["执行成本"] * 100:+.3f}%）')
+    # 子图：每小时执行成本，正 = 实盘跑输回测（红），负 = 实盘跑赢（绿）
+    _draw_bars_by_sign(ax_ec, times, cost_df['执行成本'].fillna(0) * 100, red, green,
+                       label=f'执行成本 = 回测收益 − 实盘收益(剔资金费)  正=实盘跑输/红，负=跑赢/绿'
+                             f'（本次 {latest["执行成本"] * 100:+.3f}%）')
     bt_fee_proxy = mtlines.Line2D([], [], linestyle='none',
                                   label=f'回测手续费（本次 {latest["回测手续费率"] * 100:.4f}%）')
     ec_handles, ec_labels = ax_ec.get_legend_handles_labels()
@@ -866,10 +869,12 @@ def draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config: AccountCon
     # 子图：累积执行成本（复利）：直接对每小时执行成本累乘，等价于 ∏(1+实盘剔资金费)/∏(1+回测) - 1。
     # 缺失的小时（部署后第一小时只有回测、重启后缺上一小时实盘）执行成本是 NaN，按 0 处理不参与累乘
     cum_cost = ((1 + cost_df['执行成本'].fillna(0)).cumprod() - 1) * 100
+    cum_latest = cum_cost.iloc[-1]
+    cum_desc = f'实盘比回测少赚 {cum_latest:.2f}%' if cum_latest >= 0 else f'实盘比回测多赚 {-cum_latest:.2f}%'
     ax_ecc.plot(times, cum_cost.to_numpy(), color='#7b3fbf', linewidth=2, zorder=3,
-                label=f'累积执行成本（近{window_days:.0f}天 {cum_cost.iloc[-1]:+.2f}%）')
-    ax_ecc.fill_between(times, cum_cost.to_numpy(), 0, where=(cum_cost >= 0), color=green, alpha=0.2, interpolate=True)
-    ax_ecc.fill_between(times, cum_cost.to_numpy(), 0, where=(cum_cost < 0), color=red, alpha=0.2, interpolate=True)
+                label=f'累积执行成本  正=实盘跑输/红，负=跑赢/绿（近{window_days:.0f}天 {cum_latest:+.2f}%，{cum_desc}）')
+    ax_ecc.fill_between(times, cum_cost.to_numpy(), 0, where=(cum_cost >= 0), color=red, alpha=0.2, interpolate=True)
+    ax_ecc.fill_between(times, cum_cost.to_numpy(), 0, where=(cum_cost < 0), color=green, alpha=0.2, interpolate=True)
     ax_ecc.axhline(0, color='black', linewidth=0.8, alpha=0.6, zorder=1)
     ax_ecc.legend(loc='upper left')
 
