@@ -24,7 +24,7 @@ from config import stable_symbol
 from core.binance.base_client import BinanceClient
 from core.model.account_config import AccountConfig
 from core.model.backtest_config import BacktestConfig, MultiEquityBacktestConfig
-from core.utils.datatools import load_bmac_data
+from core.utils.datatools import load_bmac_data, get_bmac_ready_time
 from core.utils.dingding import send_wechat_work_msg
 from core.utils.log_kit import logger
 from core.utils.path_kit import get_file_path, get_folder_path
@@ -216,6 +216,33 @@ def save_symbol_order(symbol_order, run_time, account_name):
 
     select_symbol_list.to_csv(select_symbol_list_path)
     del_hist_files(dir_path, 999, file_suffix='.csv')
+
+
+def save_run_timing(run_time, account_name, data_ready_time, calc_done_time, order_done_time):
+    """
+    记录每一轮调仓的三个关键时刻：数据中心更新完成、因子计算(策略计算)完成、下单完成。
+    追加写入 data/<账户名>/运行时间记录.csv，供 statistics.py 画"运行时间"子图。
+    同一个 run_time 重复运行时以最后一次为准。
+    """
+    file_path = Path(data_path) / account_name / '运行时间记录.csv'
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    new_row = pd.DataFrame([{
+        'run_time': run_time,
+        '数据更新时间': data_ready_time,
+        '因子计算时间': calc_done_time,
+        '下单时间': order_done_time,
+    }])
+    if file_path.exists():
+        timing_df = pd.read_csv(file_path, encoding='utf-8-sig', parse_dates=['run_time', '数据更新时间', '因子计算时间', '下单时间'])
+        timing_df = pd.concat([timing_df, new_row], ignore_index=True)
+        timing_df.drop_duplicates(subset=['run_time'], keep='last', inplace=True)
+        timing_df.sort_values('run_time', inplace=True)
+    else:
+        timing_df = new_row
+    # 最多保留 30 天（按小时记录），避免文件无限增长
+    timing_df = timing_df.tail(24 * 30)
+    timing_df.to_csv(file_path, encoding='utf-8-sig', index=False)
 
 
 def ignore_error(anything):

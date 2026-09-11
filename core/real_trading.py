@@ -12,6 +12,7 @@ Author: 邢不行
 
 import shutil
 import time
+from datetime import datetime
 
 import pandas as pd
 
@@ -21,7 +22,8 @@ from core.model.account_config import AccountConfig
 from core.model.backtest_config import MultiEquityBacktestConfig, BacktestConfig
 from core.position import calc_target_position
 from core.utils.functions import refresh_diff_time, save_symbol_order, save_final_select_results, save_position_results, \
-    save_performance_df_csv
+    save_performance_df_csv, save_run_timing
+from core.utils.datatools import get_bmac_ready_time
 from core.utils.log_kit import logger, divider
 from core.utils.path_kit import get_folder_path
 from core.utils.statis_func import save_position_snapshot
@@ -82,6 +84,8 @@ def run_by_account(acct_conf: AccountConfig, me_conf: MultiEquityBacktestConfig,
     # ====================================================================================================
     # 记录一下时间戳
     r_time = time.time()
+    # 数据中心本轮数据更新完成的时刻（取 ready 标记文件的 mtime），用于推送图里的"运行时间"子图
+    data_ready_time = get_bmac_ready_time(run_time)
 
     # ====================================================================================================
     # ** 2. 子策略回测 **
@@ -148,6 +152,7 @@ def run_by_account(acct_conf: AccountConfig, me_conf: MultiEquityBacktestConfig,
     logger.info(f'下单信息：{symbol_order}\n')
 
     logger.ok(f'{acct_conf.name}策略计算总消耗时间：{time.time() - r_time:.2f}s，准备下单...')
+    calc_done_time = datetime.now()  # 因子计算/选币/目标仓位全部算完的时刻
     # 调试模式，打印下单信息之后即可退出程序
     if is_debug:
         if is_simulate == 'simulate':
@@ -170,6 +175,7 @@ def run_by_account(acct_conf: AccountConfig, me_conf: MultiEquityBacktestConfig,
     failed_orders += acct_conf.proceed_spot_order(symbol_order, df_spot_ratio.empty, is_only_sell=True) or []
     failed_orders += acct_conf.proceed_swap_order(symbol_order) or []
     failed_orders += acct_conf.proceed_spot_order(symbol_order, df_spot_ratio.empty, is_only_sell=False) or []
+    order_done_time = datetime.now()  # 现货卖出、合约、现货买入三段下单全部完成的时刻
 
     if failed_orders:
         pd.DataFrame(failed_orders).to_csv(
@@ -191,5 +197,8 @@ def run_by_account(acct_conf: AccountConfig, me_conf: MultiEquityBacktestConfig,
     # ===保存选币数据(平均一天 2G 的数据，最多保留 3 天)
     save_final_select_results(run_time, me_conf, acct_conf.name, max_file_limit=24 * 3)
 
-    # ===保存下单数据
+    # ===保存本轮三个关键时刻（数据更新、因子计算、下单），供推送图展示
+    save_run_timing(run_time, acct_conf.name, data_ready_time, calc_done_time, order_done_time)
+
+    # ===保存下单数据（账户换仓信息文件是 dingzhen.py 判断"本轮调仓结束"的信号，保持它是最后落盘的产物）
     save_symbol_order(symbol_order, run_time, acct_conf.name)

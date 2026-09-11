@@ -51,6 +51,23 @@ def check_bmac_update_flag(run_time):
     return check_flags(run_time, [spot_ready_file_path, swap_ready_file_path])
 
 
+def get_bmac_ready_time(run_time):
+    """
+    读取数据中心本轮 ready 标记文件的修改时间，作为"数据更新完成时间"。
+    现货/合约两个标记取较晚的那个；文件不存在（例如调试模式）返回 None。
+    """
+    minute = run_time.minute
+    ts = int(run_time.timestamp())
+    ready_paths = [
+        bmac_data_path / f'{minute}m' / f"spot_dict_{ts}.ready",
+        bmac_data_path / f'{minute}m' / f"swap_dict_{ts}.ready",
+    ]
+    mtimes = [path.stat().st_mtime for path in ready_paths if path.exists()]
+    if not mtimes:
+        return None
+    return datetime.fromtimestamp(max(mtimes))
+
+
 def check_bmac_pivot_flag(run_time):
     minute = run_time.minute
     ts = int(run_time.timestamp())

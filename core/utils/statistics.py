@@ -737,7 +737,7 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
         return equity_df
 
     # =画图
-    fig, (ax1, ax3, ax_nl, ax4, ax5, ax6, ax7) = plt.subplots(7, 1, figsize=(12, 18), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 1, 3]})
+    fig, (ax1, ax3, ax_nl, ax4, ax5, ax6, ax_rt, ax7) = plt.subplots(8, 1, figsize=(12, 20), gridspec_kw={'height_ratios': [3, 1, 1, 1, 1, 1, 1, 3]})
     # 标记买入和卖出点
     buy_signals = equity_df[(equity_df['type'] == 'transfer') & (equity_df['账户总净值'] > 0)]
     # 移除 bf 利息加仓部分: 加仓金额 < 当前资金 * 10% / 365
@@ -888,6 +888,30 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     ax6.legend(loc='upper left')
     ax6.grid(True, linestyle='--', linewidth=0.5)
     ax6.set_xlabel('Time')
+
+    # 新增子图：每轮调仓的三个关键时刻（数据更新完成 / 因子计算完成 / 下单完成）
+    # y 轴是各时刻相对该轮 run_time（整点 + hour_offset）的秒数，三条线越靠下代表越早完成
+    timing_cols = ['数据更新时间', '因子计算时间', '下单时间']
+    timing_colors = ['#1f77b4', '#ff7f0e', '#d62728']
+    timing_path = get_file_path(data_path, account_config.name, '运行时间记录.csv', as_path_type=True)
+    timing_df = pd.DataFrame()
+    if timing_path.exists():
+        timing_df = pd.read_csv(timing_path, encoding='utf-8-sig', parse_dates=['run_time'] + timing_cols)
+        timing_df = timing_df[timing_df['run_time'] >= equity_df['time'].min()].reset_index(drop=True)
+    if timing_df.empty:
+        ax_rt.text(0.5, 0.5, '暂无运行时间记录', ha='center', va='center', transform=ax_rt.transAxes)
+    else:
+        latest = timing_df.iloc[-1]
+        for col, color in zip(timing_cols, timing_colors):
+            offset_sec = (timing_df[col] - timing_df['run_time']).dt.total_seconds()
+            latest_str = latest[col].strftime('%H:%M:%S') if pd.notna(latest[col]) else '无'
+            ax_rt.plot(timing_df['run_time'].to_numpy(), offset_sec.to_numpy(),
+                       label=f'{col}（本次 {latest_str}）', color=color, linewidth=2, alpha=0.8)
+        ax_rt.set_xlim(equity_df['time'].min(), equity_df['time'].max())
+    ax_rt.set_ylabel('距 run_time 秒数')
+    ax_rt.legend(loc='upper left')
+    ax_rt.grid(True, linestyle='--', linewidth=0.5)
+    ax_rt.set_xlabel('Time')
 
     # 增加资金曲线副图
     ax7.scatter(buy_signals['time'], buy_signals['net'], marker='+', color='black', label='add', s=100)
