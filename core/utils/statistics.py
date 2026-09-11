@@ -1104,9 +1104,8 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     ax6.grid(True, linestyle='--', linewidth=0.5)
     ax6.set_xlabel('Time')
 
-    # 新增子图：每轮调仓三个阶段各自的耗时（堆叠柱），从下往上依次是
+    # 新增子图：每轮调仓三个阶段各自的耗时（三条独立曲线）
     #   等数据 = 数据更新时间 - run_time、因子计算 = 因子计算时间 - 数据更新时间、下单 = 下单时间 - 因子计算时间
-    # 柱子总高度就是从 run_time 到下单完成的总耗时
     timing_cols = ['数据更新时间', '因子计算时间', '下单时间']
     timing_phases = ['等数据', '因子计算', '下单']
     timing_colors = ['#1f77b4', '#ff7f0e', '#d62728']
@@ -1118,14 +1117,15 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     if timing_df.empty:
         ax_rt.text(0.5, 0.5, '暂无运行时间记录', ha='center', va='center', transform=ax_rt.transAxes)
     else:
+        # 三段耗时各画一条独立曲线（不堆叠），方便横向比较某个时点各段各自花了多久；总耗时只在图例里给数字
         prev_cols = ['run_time'] + timing_cols[:-1]
-        bottom = np.zeros(len(timing_df))
+        total = np.zeros(len(timing_df))
         for col, prev_col, phase, color in zip(timing_cols, prev_cols, timing_phases, timing_colors):
             duration = (timing_df[col] - timing_df[prev_col]).dt.total_seconds().clip(lower=0).fillna(0).to_numpy()
-            ax_rt.bar(timing_df['run_time'].to_numpy(), duration, bottom=bottom, width=0.9 / 24,
-                      label=f'{phase}（本次 {duration[-1]:.0f}s）', color=color, alpha=0.85, zorder=2)
-            bottom += duration
-        total_proxy = mtlines.Line2D([], [], linestyle='none', label=f'总耗时（本次 {bottom[-1]:.0f}s）')
+            ax_rt.plot(timing_df['run_time'].to_numpy(), duration, label=f'{phase}（本次 {duration[-1]:.0f}s）',
+                       color=color, linewidth=2, alpha=0.8, marker='.', markersize=4, zorder=2)
+            total += duration
+        total_proxy = mtlines.Line2D([], [], linestyle='none', label=f'总耗时（本次 {total[-1]:.0f}s）')
         rt_handles, rt_labels = ax_rt.get_legend_handles_labels()
         ax_rt.legend(handles=rt_handles + [total_proxy], labels=rt_labels + [total_proxy.get_label()],
                      loc='upper left')
