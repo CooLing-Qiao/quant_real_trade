@@ -12,6 +12,7 @@ Author: 邢不行
 import time
 import traceback
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 
@@ -521,6 +522,52 @@ class StandardClient(BinanceClient):
     def get_unimmr(self):
         # 普通账户-现货没有杠杆，所以直接返回999
         return 999
+
+    def get_swap_income_df(self, date_time, account_type='um') -> Optional[pd.DataFrame]:
+        """
+        通过 GET /fapi/v1/income 获取 U 本位合约账户的资金流水（普通账户版，接口与
+        portfolio_margin_client.get_swap_income_df 保持一致的返回结构：time 为 UTC、income 为 float）。
+        incomeType 包含 TRANSFER, REALIZED_PNL, FUNDING_FEE, COMMISSION, INSURANCE_CLEAR 等。
+        statistics.py 里算"执行成本/资金费"子图用它取 FUNDING_FEE。
+        :param date_time: 起始时间（本地时间的 datetime）
+        :param account_type: 只支持 'um'，普通账户没有币本位这条链路
+        :return:
+        """
+        if account_type != 'um':
+            return None
+        params = {
+            'startTime': int(date_time.timestamp()) * 1000,
+            'limit': 1000,
+            'timestamp': ''
+        }
+        df_list = []
+        while True:
+            logger.info(f'获取U合约资金流水，{params}...')
+            income = retry_wrapper(self.exchange.fapiprivate_get_income, params=params,
+                                   func_name='获取U合约资金流水', if_exit=False)
+            df = pd.DataFrame(income) if income else pd.DataFrame()
+            if df.empty:
+                break
+
+            df['income'] = pd.to_numeric(df['income'], errors='coerce')
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            df_list.append(df)
+
+            # 不足一页说明已经取完；否则从最后一条继续翻页
+            if len(df) < params['limit']:
+                break
+            if int(df.iloc[-1]['time'].timestamp()) * 1000 == params['startTime']:
+                break
+            params['startTime'] = int(df.iloc[-1]['time'].timestamp()) * 1000
+
+        if not df_list:
+            return None
+
+        all_df = pd.concat(df_list, ignore_index=True, copy=False)
+        all_df.drop_duplicates(subset=['time', 'symbol', 'incomeType', 'income', 'asset', 'info'], keep='last',
+                               inplace=True)
+        all_df.sort_values(by=['time', 'symbol'], ascending=[True, True], inplace=True)
+        return all_df
 
     def _collect_asset_from_spot_to_swap(self, asset='USDT'):
         # =将现货中的U转入的合约账号

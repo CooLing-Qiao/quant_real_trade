@@ -863,8 +863,11 @@ def draw_execution_cost(ax_ec, ax_ecc, ax_ff, ax_ffc, account_config: AccountCon
     ax_ec.legend(handles=ec_handles + [bt_fee_proxy], labels=ec_labels + [bt_fee_proxy.get_label()], loc='upper left')
 
     # 子图：累积执行成本（复利）
-    cum_live = (1 + cost_df['实盘收益_剔除资金费'].fillna(0)).cumprod()
-    cum_bt = (1 + cost_df['回测收益'].fillna(0)).cumprod()
+    # 实盘和回测必须同一小时成对参与：只要有一边缺（部署后第一小时只有回测、重启后缺上一小时实盘），
+    # 这一小时两边都按 0 处理，否则回测那 -1.3% 会单方面进累积，把执行成本抬高
+    valid = cost_df['执行成本'].notna()
+    cum_live = (1 + cost_df['实盘收益_剔除资金费'].where(valid, 0)).cumprod()
+    cum_bt = (1 + cost_df['回测收益'].where(valid, 0)).cumprod()
     cum_cost = (cum_live / cum_bt - 1) * 100
     ax_ecc.plot(times, cum_cost.to_numpy(), color='#7b3fbf', linewidth=2, zorder=3,
                 label=f'累积执行成本（近{window_days:.0f}天 {cum_cost.iloc[-1]:+.2f}%）')
@@ -1101,9 +1104,11 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     ax6.grid(True, linestyle='--', linewidth=0.5)
     ax6.set_xlabel('Time')
 
-    # 新增子图：每轮调仓的三个关键时刻（数据更新完成 / 因子计算完成 / 下单完成）
-    # y 轴是各时刻相对该轮 run_time（整点 + hour_offset）的秒数，三条线越靠下代表越早完成
+    # 新增子图：每轮调仓三个阶段各自的耗时（堆叠柱），从下往上依次是
+    #   等数据 = 数据更新时间 - run_time、因子计算 = 因子计算时间 - 数据更新时间、下单 = 下单时间 - 因子计算时间
+    # 柱子总高度就是从 run_time 到下单完成的总耗时
     timing_cols = ['数据更新时间', '因子计算时间', '下单时间']
+    timing_phases = ['等数据', '因子计算', '下单']
     timing_colors = ['#1f77b4', '#ff7f0e', '#d62728']
     timing_path = get_file_path(data_path, account_config.name, '运行时间记录.csv', as_path_type=True)
     timing_df = pd.DataFrame()
@@ -1113,15 +1118,19 @@ def draw_equity_and_send_pic(me_conf, equity_df, transfer_df, title, account_con
     if timing_df.empty:
         ax_rt.text(0.5, 0.5, '暂无运行时间记录', ha='center', va='center', transform=ax_rt.transAxes)
     else:
-        latest = timing_df.iloc[-1]
-        for col, color in zip(timing_cols, timing_colors):
-            offset_sec = (timing_df[col] - timing_df['run_time']).dt.total_seconds()
-            latest_str = latest[col].strftime('%H:%M:%S') if pd.notna(latest[col]) else '无'
-            ax_rt.plot(timing_df['run_time'].to_numpy(), offset_sec.to_numpy(),
-                       label=f'{col}（本次 {latest_str}）', color=color, linewidth=2, alpha=0.8)
+        prev_cols = ['run_time'] + timing_cols[:-1]
+        bottom = np.zeros(len(timing_df))
+        for col, prev_col, phase, color in zip(timing_cols, prev_cols, timing_phases, timing_colors):
+            duration = (timing_df[col] - timing_df[prev_col]).dt.total_seconds().clip(lower=0).fillna(0).to_numpy()
+            ax_rt.bar(timing_df['run_time'].to_numpy(), duration, bottom=bottom, width=0.9 / 24,
+                      label=f'{phase}（本次 {duration[-1]:.0f}s）', color=color, alpha=0.85, zorder=2)
+            bottom += duration
+        total_proxy = mtlines.Line2D([], [], linestyle='none', label=f'总耗时（本次 {bottom[-1]:.0f}s）')
+        rt_handles, rt_labels = ax_rt.get_legend_handles_labels()
+        ax_rt.legend(handles=rt_handles + [total_proxy], labels=rt_labels + [total_proxy.get_label()],
+                     loc='upper left')
         ax_rt.set_xlim(equity_df['time'].min(), equity_df['time'].max())
-    ax_rt.set_ylabel('距 run_time 秒数')
-    ax_rt.legend(loc='upper left')
+    ax_rt.set_ylabel('耗时(秒)')
     ax_rt.grid(True, linestyle='--', linewidth=0.5)
     ax_rt.set_xlabel('Time')
 
