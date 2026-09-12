@@ -46,9 +46,13 @@ strategy_pool = [
     dict(
         name='动量超混策略',
         strategy_list=[
+    # 第十八轮最终配置，与根目录 config.py 的 strategy_list 逐字一致（同步于 2026-09-12），
+    # 依据见 research/optimization_round18/RESULTS.md；回测侧改动后必须把这一段重新同步过来。
     {
-        # 第九轮最终配置，见 research/optimization_round9/RESULTS.md
-        # （同步自根目录 config.py；执行门槛 min_order_usdt_ratio=0.0138）
+        # Acc 多头，短窗口 89。Acc_reverse 是布林带突破的滚动积分因子（动量，不是均值回归），
+        # 参数 (n, 上轨倍数, 下轨倍数, taker_pow)：上轨守 Bollinger 标准的 2.0；下轨外推到 2.3
+        # 减少向下突破对多头的拖累（第十四~十六轮）；taker_pow=2.5 让每根向上突破按
+        # (2*主动买入成交额占比)^2.5 加权，买方主动推上去的突破计入更多（第十八轮，p∈[2,3] 是平台）。
         "strategy": "Strategy_Acc多头_89",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -59,12 +63,12 @@ strategy_pool = [
         'long_select_coin_num': 1,
         'short_select_coin_num': 0,
         "factor_list": [
-            # (89, 上轨2.0, 下轨2.3)：上轨保持 Bollinger 标准的 2 倍不动，只把下轨外推。
-            # 下轨只影响向下突破产生的负 deviate，对多头是纯拖累。
-            # 与回测 config.py 同步，详见 research/optimization_round16/RESULTS.md
-            ('Acc_reverse', False, (89, 2.0, 2.3), 1),
+            ('Acc_reverse', False, (89, 2.0, 2.3, 2.5), 1),
         ],
         "long_filter_list": [],
+        # 不要给 Acc 多头加"收盘价须在均线上方"之类的方向过滤：dev_sum 是滚动求和，被选中的币
+        # 常已回踩到均线下方，那正是它要抓的"突破后回踩"入场点，加了会把入场点全部过滤掉（详见 CLAUDE.md）。
+        # DrawdownFromHigh(18) 是例外：拦的是买入瞬间正撞上单根拉高砸回的极端插针，不是回踩节奏。
         "long_filter_list_post": [
             ('DrawdownFromHigh', 18, 'val:>-0.25', False),
             ('VolumeMeanRatio', 48, 'val:>0.45', False),
@@ -81,6 +85,7 @@ strategy_pool = [
     },
 ] + [
     {
+        # Acc 多头，长窗口 550。下轨外推到 3.0（邻域 2.8~3.2 是平台）；未加 taker 加权（实测为负）。
         "strategy": "Strategy_Acc多头_550",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -91,10 +96,10 @@ strategy_pool = [
         'long_select_coin_num': 1,
         'short_select_coin_num': 0,
         "factor_list": [
-            # (550, 上轨2.0, 下轨3.0)：同上。与回测 config.py 同步。
             ('Acc_reverse', False, (550, 2.0, 3.0), 1),
         ],
         "long_filter_list": [],
+        # ('Acc_reverse', 89, ...) 是另一个因子实例（int 参数 → 上下轨都是 2.0），阈值针对该分布调出，保持 int 写法不动。
         "long_filter_list_post": [
             ('DrawdownFromHigh', 400, 'val:>-0.30', False),
             ('VolumeMeanRatio', 24, 'val:>0.45', False),
@@ -102,12 +107,16 @@ strategy_pool = [
             ('Dbcd', 17, 'val:<3.9267862', False),
             ('Acc_reverse', 89, 'val:>-0.00088426011', False),
             ('ZfStd', 48, 'val:>0.017593278', False),
+            ('WickReverse', 24, 'val:<0.087966821', False),   # 第十八轮，q0.9
         ],
         "short_filter_list": [],
         "use_custom_func": False
     },
 ] + [
     {
+        # Acc 空头，窗口 230。Acc_reverse_v3 在 Acc_reverse 基础上给"暴跌后反弹"的惩罚加了分层锚点：
+        # 过去 96 根内单根跌幅破 severe_thresh(-35%) 时，参考价改用离当前最近的那根深跌 K 线，
+        # 避免拿很久以前的深跌当基准；布林倍数内部硬编码 2.05（第十一轮）。
         "strategy": "Strategy_Acc空头",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -122,6 +131,9 @@ strategy_pool = [
         ],
         "long_filter_list": [],
         "short_filter_list": [],
+        # BounceFromCrashLow：只在暴跌事件期间生效、按暴跌锚点算反弹幅度，反弹超过 55% 不做空
+        # （拦截率仅 0.45%，价值集中在极少数极端挤仓事件）。挡得更死的 'ep' 锚点实测惨败——
+        # Acc 空头的 edge 就来自"暴跌币反弹后继续跌"，挡太死会把 edge 一起挡掉。
         "short_filter_list_post": [
             ('BounceFromCrashLow', ('v3', -0.35), 'val:<0.55', False),
             ('VolumeMeanRatio', 48, 'val:>0.45', False),
@@ -130,6 +142,8 @@ strategy_pool = [
     },
 ] + [
     {
+        # Trix 多头，短窗口 55。Trix = 三重 EMA 的一阶相对变化（注意 ewm 的参数是 com，等价 span=111）；
+        # 内部参数第十二、十七轮扫过，现值全部最优，不要再动。
         "strategy": "Strategy_Trix多头_55",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -160,6 +174,7 @@ strategy_pool = [
     },
 ] + [
     {
+        # Trix 多头，长窗口 610。
         "strategy": "Strategy_Trix多头_610",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -179,12 +194,15 @@ strategy_pool = [
             ('ZfStd', 48, 'val:>0.020861992', False),
             ('跌幅max', 48, 'val:>0.02576173', False),
             ('RealizedVol', 24, 'val:>0.007657194', False),
+            ('Rsimean', 12, 'val:>0.38715301', False),   # 第十八轮，q0.25；砍掉本子策略 19.7% 的持仓小时，消融贡献最大
         ],
         "short_filter_list": [],
         "use_custom_func": False
     },
 ] + [
     {
+        # Trix 空头，窗口 145。Trix_v2 = Trix + 与 Acc_reverse_v3 同结构的暴跌护栏：暴跌尚未反弹回参考价时，
+        # 把负的 trix 翻正、退出空头候选（不追空死猫跳）；只作用于 trix<0 的分支，多头候选不受影响。
         "strategy": "Strategy_Trix空头",
         "offset_list": list(range(0, 1, 1)),
         "hold_period": "1H",
@@ -199,9 +217,11 @@ strategy_pool = [
         ],
         "long_filter_list": [],
         "short_filter_list": [],
+        # 两个 BounceFromLow：短窗口抓单小时暴力插针，长窗口抓多天慢速逼空，单一窗口只能堵一类。
         "short_filter_list_post": [
             ('BounceFromLow', 22, 'val:<0.28', False),
             ('BounceFromLow', 400, 'val:<0.55', False),
+            ('Trix', 610, 'val:>-0.00033041095', False),   # 第十八轮，q0.1：长周期 Trix 跌得最凶的 10% 不做空
         ],
         "use_custom_func": False
     },
@@ -209,7 +229,7 @@ strategy_pool = [
     ),
 ]
 
-leverage = 4  # 杠杆数。我看哪个赌狗要把这里改成大于1的。高杠杆如梦幻泡影。不要想着一夜暴富，脚踏实地赚自己该赚的钱。
+leverage = 4.2  # 杠杆数。我看哪个赌狗要把这里改成大于1的。高杠杆如梦幻泡影。不要想着一夜暴富，脚踏实地赚自己该赚的钱。
 black_list = ['BTC-USDT', 'ETH-USDT']  # 拉黑名单，永远不会交易。不喜欢的币、异常的币。例：LUNA-USDT, 这里与实盘不太一样，需要有'-'
 white_list = []  # 如果不为空，即只交易这些币，只在这些币当中进行选币。例：LUNA-USDT, 这里与实盘不太一样，需要有'-'
 rebalance_mode = {'mode': 'RebByEquityRatio',

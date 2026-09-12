@@ -20,8 +20,20 @@ def signal(*args):
     # 原来用同一个倍数锁死两侧只能取折中，这也是过去单调 mult 怎么调都变差的原因。
     # 上轨一律保持 2（Bollinger 的标准定义，不参与寻优）；只把下轨外推。
     # 详见 research/optimization_round14/RESULTS.md、round15、round16。
+    #
+    # 第十八轮（2026-09-12）再加一个可选的第 4 项 taker_pow：(n, upper_mult, lower_mult, taker_pow)。
+    # 对每根向上突破的 K 线，把突破幅度乘以 (2 * 主动买入成交额占比) ** taker_pow——
+    # 主动买占比 50% 时权重为 1（等同原版），占比越高说明突破是买方主动推上去的，计入权重越大；
+    # 向下突破的 K 线对称地乘以 (2 * 主动卖出占比) ** taker_pow。不传第 4 项时完全等同原版。
+    # 依据：research/因子研究资料/ 里"动量叠主动成交"的思路；Acc多头89 上 p∈[2,3] 是平台
+    # （+9.4% / +10.0% / +9.6%），p=1.5 与 p=4 两侧下落，取平台中心 2.5，七档杠杆全正。
+    # 详见 research/optimization_round18/RESULTS.md。
+    taker_pow = None
     if isinstance(param, (tuple, list)):
-        n, upper_mult, lower_mult = param
+        if len(param) == 4:
+            n, upper_mult, lower_mult, taker_pow = param
+        else:
+            n, upper_mult, lower_mult = param
     else:
         n, upper_mult, lower_mult = param, 2, 2
 
@@ -56,6 +68,10 @@ def signal(*args):
         [(df['low'] - upper) / mean, (df['high'] - lower) / mean],
         default=0.0,
     )
+    if taker_pow is not None:
+        buy_ratio = (df['taker_buy_quote_asset_volume'] / (df['quote_volume'] + eps)).clip(0, 1)
+        confirm = np.where(deviate > 0, 2 * buy_ratio, np.where(deviate < 0, 2 * (1 - buy_ratio), 1.0))
+        deviate = deviate * (pd.Series(confirm, index=df.index) ** float(taker_pow)).fillna(1.0).to_numpy()
     dev_sum = pd.Series(deviate, index=df.index).rolling(n, min_periods=1).sum()
 
     # 没有acc的时候，用mtm来比较
